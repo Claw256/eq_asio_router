@@ -1,5 +1,7 @@
 # EQ ASIO Router
 
+> **AI-generated code disclaimer:** This project was built with Claude 5.5 Sonnet (Anthropic), an AI model. The code has not been independently audited. It may contain bugs and is provided as is, so review it and test it before relying on it. Licensed under the [MIT License](LICENSE).
+
 A Windows application written in Rust that takes system audio from a virtual cable (VB-Audio Hi-Fi Cable), runs it through an AutoEQ parametric equalizer and plays it out of a Yamaha/Steinberg USB ASIO device at the lowest latency the hardware allows. It replaces a Voicemeeter / Peace routing chain with one small tray application.
 
 Status: working and clean (no crackle) on the author's machine (Steinberg UR22C). The latency model total with the Hi-Fi Cable source is 56.2 ms, but the end-to-end click measurement (`router-cli latency`) gave 152-164 ms because the cable driver adds about 100 ms on the render side. A lower-latency source (VAC "Line 1": fixed 6 ms capture period, render keep-alive, automatic fallback, GUI preset) measured end to end about 50-52 ms for an ordinary 10 ms shared-mode app; an app using IAudioClient3 low-latency shared mode should reach about 32 ms (render side measured with injected clicks, not the full chain; real games not measured). See [docs/latency.md](docs/latency.md) and the [VAC Line 1 quick start](docs/setup-guide.md#vac-line-1-quick-start).
