@@ -1,0 +1,11 @@
+[package]
+name = "asio-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+asio-abi.workspace = true
+asio-host.workspace = true
+anyhow.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation"] }

@@ -1,0 +1,21 @@
+# Build output
+/target/
+
+# Vendored third-party repos (have their own git history)
+/Windows-driver-samples/
+/low-latency-audio/
+
+# Measurement captures and logs (large, machine-specific recordings)
+/measure/dump_*/
+/measure/*.wav
+/measure/*.log
+/measure/*.packets.txt
+/measure/__pycache__/
+
+# Editor / OS
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

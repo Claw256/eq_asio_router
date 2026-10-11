@@ -1,0 +1,39 @@
+[package]
+name = "eq-asio-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "eq-asio-app"
+path = "src/main.rs"
+
+[dependencies]
+eq-core.workspace = true
+asio-host.workspace = true
+router-engine = { path = "../router-engine" }
+wasapi-capture = { path = "../wasapi-capture" }
+serde.workspace = true
+toml.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+egui_plot = "0.37.0"
+egui = "0.36"
+rfd = "0.17.2"
+
+[features]
+default = []
+# Use the wgpu renderer instead of glow (OpenGL).
+wgpu = ["eframe/wgpu"]

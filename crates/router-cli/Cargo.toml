@@ -1,0 +1,18 @@
+[package]
+name = "router-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "router-cli"
+path = "src/main.rs"
+
+[dependencies]
+asio-host.workspace = true
+eq-core.workspace = true
+router-engine = { path = "../router-engine" }
+router-core = { path = "../router-core" }
+wasapi-capture = { path = "../wasapi-capture" }
+anyhow.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }

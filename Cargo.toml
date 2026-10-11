@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/asio-abi",
+    "crates/asio-host",
+    "crates/asio-probe",
+    "crates/eq-core",
+    "crates/eq-asio-driver",
+    "crates/eq-asio-app",
+    "crates/router-core",
+    "crates/wasapi-capture",
+    "crates/router-engine",
+    "crates/router-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+arc-swap = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+windows = "0.62"
+asio-abi = { path = "crates/asio-abi" }
+asio-host = { path = "crates/asio-host" }
+eq-core = { path = "crates/eq-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
