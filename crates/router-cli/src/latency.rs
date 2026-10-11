@@ -174,6 +174,7 @@ pub fn run(args: &[String]) -> Result<()> {
     cfg.profile.preamp_db = f64::from(FORCED_PREAMP_DB);
     cfg.limiter = true;
     cfg.bypass = false;
+    cfg.eq_enabled = true;
     let cfg = cfg.sanitized();
     if o.baseline {
         return run_baseline(args, &o, &cfg);

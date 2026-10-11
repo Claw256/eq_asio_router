@@ -1,6 +1,7 @@
 //! Biquad filters (RBJ cookbook) and the stereo EQ chain.
 
 use crate::autoeq::EqProfile;
+use crate::config::{JblLfoTarget, JblParams};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
@@ -220,13 +221,16 @@ const BASS_FX_TRIM_DB: f32 = -1.5;
 ///
 /// Low shelf boost, `tanh` clipping, then a gain dip keyed by the bass envelope so the
 /// mids and highs duck with each bass hit (an amp running out of headroom). The wet amount
-/// ramps over ~10 ms so toggling is click-free. Allocation-free per sample.
+/// ramps over ~10 ms so toggling is click-free. Every stage is driven by [`JblParams`]
+/// (values at 100 % intensity; the intensity scales them from idle). An optional LFO
+/// "trunk rattle" modulates the output gain and/or the kick-band level. Allocation-free per sample.
 #[derive(Clone, Copy, Debug)]
 pub struct BassFx {
     fs: f64,
     target: f32,
     mix: f32,
     intensity: f32,
+    params: JblParams,
     drive: f32,
     duck: f32,
     shelf_l: Biquad,
@@ -235,30 +239,35 @@ pub struct BassFx {
     env: f32,
     attack: f32,
     release: f32,
-    /// Low-quality mids/highs: quantiser step, sample-hold factor and a dulling low pass.
+    /// Low-quality mids/highs: quantiser step (0 = off), sample-hold factor and a dulling low pass.
     quant_step: f32,
     hold: u32,
     hold_pos: u32,
     held: [f32; 2],
     lp_l: Biquad,
     lp_r: Biquad,
-    /// Sub resonance (~50 Hz peak) ahead of the clipper, and clip asymmetry bias.
+    /// Sub resonance peak ahead of the clipper, and clip asymmetry bias.
     res_l: Biquad,
     res_r: Biquad,
     bias: f32,
-    /// Extra kick/bass-only saturation: bass-band splitter and its drive.
+    /// Extra kick/bass-only saturation: bass-band splitter and its drive (`kick_on`).
+    kick_on: bool,
     kick_l: Biquad,
     kick_r: Biquad,
     kick_drive: f32,
     /// Output trim that keeps the loudness near 0 dB versus the dry signal.
     out_gain: f32,
+    /// Rattle LFO: phase (0..1, kept across reconfiguration), per-sample increment, effective
+    /// depth (0 = inactive), and which paths it modulates.
+    lfo_phase: f32,
+    lfo_inc: f32,
+    lfo_depth: f32,
+    lfo_follow: bool,
+    lfo_gain: bool,
+    lfo_band: bool,
 }
 
 impl BassFx {
-    const SHELF_HZ: f64 = 70.0;
-    const DETECT_HZ: f64 = 100.0;
-    const RES_HZ: f64 = 50.0;
-
     /// Create an inactive effect at `fs` Hz.
     pub fn new(fs: f64) -> Self {
         let mut fx = BassFx {
@@ -266,6 +275,7 @@ impl BassFx {
             target: 0.0,
             mix: 0.0,
             intensity: 0.0,
+            params: JblParams::default(),
             drive: 1.0,
             duck: 0.0,
             shelf_l: Biquad::identity(),
@@ -283,68 +293,93 @@ impl BassFx {
             res_l: Biquad::identity(),
             res_r: Biquad::identity(),
             bias: 0.0,
+            kick_on: true,
             kick_l: Biquad::identity(),
             kick_r: Biquad::identity(),
             kick_drive: 1.0,
             out_gain: 1.0,
+            lfo_phase: 0.0,
+            lfo_inc: 0.0,
+            lfo_depth: 0.0,
+            lfo_follow: false,
+            lfo_gain: false,
+            lfo_band: false,
         };
-        fx.configure(false, 0);
+        fx.configure(false, 0, &JblParams::default());
         fx
     }
 
-    /// Enable or disable and set intensity (0-100). Control path (uses `powf`).
-    pub fn set(&mut self, enabled: bool, intensity_pct: u8) {
-        self.configure(enabled, intensity_pct);
+    /// Enable or disable, set intensity (0-100) and the stage parameters. Control path (uses `powf`).
+    pub fn set(&mut self, enabled: bool, intensity_pct: u8, params: &JblParams) {
+        self.configure(enabled, intensity_pct, params);
     }
 
     /// Change the sample rate, keeping state. Invalid rates are ignored.
     pub fn set_sample_rate(&mut self, fs: f64) {
         if fs.is_finite() && fs > 0.0 {
             self.fs = fs;
-            self.configure(self.target > 0.0, (self.intensity * 100.0).round() as u8);
+            let params = self.params;
+            self.configure(self.target > 0.0, (self.intensity * 100.0).round() as u8, &params);
         }
     }
 
-    fn configure(&mut self, enabled: bool, intensity_pct: u8) {
+    fn configure(&mut self, enabled: bool, intensity_pct: u8, params: &JblParams) {
+        let p = params.sanitized();
+        self.params = p;
         let i = f32::from(intensity_pct.min(100)) / 100.0;
+        let i64_ = f64::from(i);
+        let nyq_cap = self.fs * 0.45;
         self.target = if enabled { 1.0 } else { 0.0 };
         self.intensity = i;
-        self.drive = 1.0 + 4.0 * i;
-        self.duck = 2.0 * i;
-        // Up to ~7-bit steps and 4x sample-hold, then a low pass sliding 12 kHz -> 4 kHz.
-        self.quant_step = 2.0 / 2f32.powf(16.0 - 6.0 * i);
-        self.hold = 1 + (2.0 * i).round() as u32;
-        let dull = FilterSpec {
-            kind: FilterKind::LowPass,
-            fc_hz: (14000.0 - 6500.0 * f64::from(i)).min(self.fs * 0.45),
-            gain_db: 0.0,
-            q: 0.707,
-            enabled: true,
-        };
-        self.lp_l.set_spec(&dull, self.fs);
-        self.lp_r.set_spec(&dull, self.fs);
+        self.drive = 1.0 + (p.drive_max - 1.0).max(0.0) * i;
+        self.duck = if p.duck_on { p.duck_depth.max(0.0) * i } else { 0.0 };
+        // Bit crush: step of the quantiser (0 = off), then sample-hold and a sliding low pass.
+        self.quant_step =
+            if p.crush_on { 2.0 / 2f32.powf(16.0 - (16.0 - p.crush_bits_min).max(0.0) * i) } else { 0.0 };
+        self.hold = if p.hold_on { 1 + ((p.hold_max - 1.0).max(0.0) * i).round() as u32 } else { 1 };
+        if p.lpf_on {
+            let (a, b) = (f64::from(p.lpf_hz_start), f64::from(p.lpf_hz_end));
+            let dull = FilterSpec {
+                kind: FilterKind::LowPass,
+                fc_hz: (a - (a - b) * i64_).min(nyq_cap).max(1.0),
+                gain_db: 0.0,
+                q: 0.707,
+                enabled: true,
+            };
+            self.lp_l.set_spec(&dull, self.fs);
+            self.lp_r.set_spec(&dull, self.fs);
+        } else {
+            self.lp_l = Biquad::identity();
+            self.lp_r = Biquad::identity();
+        }
         let shelf = FilterSpec {
             kind: FilterKind::LowShelf,
-            fc_hz: Self::SHELF_HZ,
-            gain_db: 12.0 * f64::from(i),
+            fc_hz: f64::from(p.shelf_hz).min(nyq_cap),
+            gain_db: f64::from(p.shelf_db) * i64_,
             q: 0.7,
             enabled: true,
         };
         self.shelf_l.set_spec(&shelf, self.fs);
         self.shelf_r.set_spec(&shelf, self.fs);
-        let res = FilterSpec {
-            kind: FilterKind::Peaking,
-            fc_hz: Self::RES_HZ,
-            gain_db: 9.0 * f64::from(i),
-            q: 3.0,
-            enabled: true,
-        };
-        self.res_l.set_spec(&res, self.fs);
-        self.res_r.set_spec(&res, self.fs);
-        self.bias = 0.35 * i;
-        // Measured loudness of the effect (dB vs dry, music-like test signal) at 0/30/60/80/100 %;
-        // interpolated and cancelled so the mode stays around 0 dB. See `bass_fx_level_report`.
-        const LEVEL_DB: [(f32, f32); 5] = [(0.0, 0.0), (0.3, 0.85), (0.6, 2.2), (0.8, 1.92), (1.0, 1.3)];
+        if p.res_on {
+            let res = FilterSpec {
+                kind: FilterKind::Peaking,
+                fc_hz: f64::from(p.res_hz).min(nyq_cap),
+                gain_db: f64::from(p.res_db) * i64_,
+                q: f64::from(p.res_q).max(0.1),
+                enabled: true,
+            };
+            self.res_l.set_spec(&res, self.fs);
+            self.res_r.set_spec(&res, self.fs);
+        } else {
+            self.res_l = Biquad::identity();
+            self.res_r = Biquad::identity();
+        }
+        self.bias = p.bias_max * i;
+        // Measured loudness of the effect (dB vs dry, music-like test signal) at 0/30/60/80/100 %
+        // for the default parameters; interpolated and cancelled so the mode stays around 0 dB.
+        // See `bass_fx_level_report`. `out_trim_db` lets the user correct drift for other settings.
+        const LEVEL_DB: [(f32, f32); 5] = [(0.0, 0.0), (0.3, 0.86), (0.6, 2.79), (0.8, 2.32), (1.0, 1.23)];
         let mut meas = LEVEL_DB[4].1;
         for w in LEVEL_DB.windows(2) {
             if i <= w[1].0 {
@@ -352,15 +387,37 @@ impl BassFx {
                 break;
             }
         }
-        self.out_gain = 0.45 * 10f32.powf((BASS_FX_TRIM_DB - meas) / 20.0);
-        self.kick_drive = 1.0 + 1.2 * i;
-        let kick = FilterSpec { kind: FilterKind::LowPass, fc_hz: 130.0, gain_db: 0.0, q: 0.707, enabled: true };
+        self.out_gain = 0.45 * 10f32.powf((BASS_FX_TRIM_DB - meas) / 20.0) * 10f32.powf(p.out_trim_db / 20.0);
+        self.kick_on = p.kick_on;
+        self.kick_drive = 1.0 + (p.kick_drive_max - 1.0).max(0.0) * i;
+        let kick = FilterSpec {
+            kind: FilterKind::LowPass,
+            fc_hz: f64::from(p.kick_hz).min(nyq_cap),
+            gain_db: 0.0,
+            q: 0.707,
+            enabled: true,
+        };
         self.kick_l.set_spec(&kick, self.fs);
         self.kick_r.set_spec(&kick, self.fs);
-        let lp = FilterSpec { kind: FilterKind::LowPass, fc_hz: Self::DETECT_HZ, gain_db: 0.0, q: 0.707, enabled: true };
+        let lp = FilterSpec {
+            kind: FilterKind::LowPass,
+            fc_hz: f64::from(p.detect_hz).min(nyq_cap),
+            gain_db: 0.0,
+            q: 0.707,
+            enabled: true,
+        };
         self.detector.set_spec(&lp, self.fs);
-        self.attack = (1.0 - (-1.0 / (0.005 * self.fs)).exp()) as f32;
-        self.release = (1.0 - (-1.0 / (0.120 * self.fs)).exp()) as f32;
+        let fs = self.fs;
+        let ms_to_coef = |ms: f32| (1.0 - (-1.0 / (f64::from(ms) / 1000.0 * fs).max(1.0)).exp()) as f32;
+        self.attack = ms_to_coef(p.duck_attack_ms);
+        self.release = ms_to_coef(p.duck_release_ms);
+        // LFO: the phase is deliberately left alone so reconfiguring does not glitch the rattle.
+        let depth = if p.lfo_on && p.lfo_depth.is_finite() { p.lfo_depth.clamp(0.0, 1.0) } else { 0.0 };
+        self.lfo_depth = depth;
+        self.lfo_inc = (f64::from(p.lfo_rate_hz.max(0.0)) / self.fs) as f32;
+        self.lfo_follow = p.lfo_follow_bass;
+        self.lfo_gain = matches!(p.lfo_target, JblLfoTarget::Gain | JblLfoTarget::Both);
+        self.lfo_band = matches!(p.lfo_target, JblLfoTarget::BassBand | JblLfoTarget::Both);
     }
 
     /// True when the effect has no audible contribution (off and fully ramped out).
@@ -375,23 +432,43 @@ impl BassFx {
         }
         let step = (1.0 / (BYPASS_RAMP_SECS * self.fs).max(1.0)) as f32;
         let norm = 1.0 / self.drive.tanh().max(1e-3);
+        let kn = 0.8 / self.kick_drive.tanh().max(1e-3);
+        let lfo_active = self.lfo_depth > 0.0 && (self.lfo_gain || (self.lfo_band && self.kick_on));
         for (xl, xr) in l.iter_mut().zip(r.iter_mut()) {
             if self.mix < self.target {
                 self.mix = (self.mix + step).min(self.target);
             } else if self.mix > self.target {
                 self.mix = (self.mix - step).max(self.target);
             }
+            // Rattle LFO: 1 - depth * 0.5 * (1 + sin), optionally only while the bass is hitting.
+            let lfo = if lfo_active {
+                let s = (2.0 * std::f32::consts::PI * self.lfo_phase).sin();
+                self.lfo_phase += self.lfo_inc;
+                if self.lfo_phase >= 1.0 {
+                    self.lfo_phase -= self.lfo_phase.floor();
+                }
+                let d = if self.lfo_follow { self.lfo_depth * self.env.min(1.0) } else { self.lfo_depth };
+                1.0 - d * 0.5 * (1.0 + s)
+            } else {
+                1.0
+            };
             let sl = self.res_l.process(self.shelf_l.process(*xl));
             let sr = self.res_r.process(self.shelf_r.process(*xr));
             // Kick/bass band gets its own heavy saturation before the full-band clipper.
-            let (kl, kr) = (self.kick_l.process(sl), self.kick_r.process(sr));
-            let kn = 0.8 / self.kick_drive.tanh().max(1e-3);
-            let sl = sl - kl + (self.kick_drive * kl).tanh() * kn;
-            let sr = sr - kr + (self.kick_drive * kr).tanh() * kn;
+            let (sl, sr) = if self.kick_on {
+                let (kl, kr) = (self.kick_l.process(sl), self.kick_r.process(sr));
+                let m = if self.lfo_band { lfo } else { 1.0 };
+                (sl - kl + (self.kick_drive * kl * m).tanh() * kn, sr - kr + (self.kick_drive * kr * m).tanh() * kn)
+            } else {
+                (sl, sr)
+            };
             let bass = self.detector.process(0.5 * (sl + sr)).abs();
             let coef = if bass > self.env { self.attack } else { self.release };
             self.env += (bass - self.env) * coef;
-            let g = 1.0 / (1.0 + self.duck * self.env.min(2.0));
+            let mut g = 1.0 / (1.0 + self.duck * self.env.min(2.0));
+            if self.lfo_gain {
+                g *= lfo;
+            }
             // Asymmetric tanh (even + odd harmonics) followed by a hard clip (square-ish, odd-rich).
             let b = self.bias;
             let ob = b.tanh();
@@ -403,10 +480,15 @@ impl BassFx {
             if self.hold_pos == 0 {
                 self.held = [yl, yr];
             }
-            self.hold_pos = (self.hold_pos + 1) % self.hold;
+            self.hold_pos = (self.hold_pos + 1) % self.hold.max(1);
             let q = self.quant_step;
-            yl = (self.held[0] / q).round() * q;
-            yr = (self.held[1] / q).round() * q;
+            if q > 0.0 {
+                yl = (self.held[0] / q).round() * q;
+                yr = (self.held[1] / q).round() * q;
+            } else {
+                yl = self.held[0];
+                yr = self.held[1];
+            }
             yl = self.lp_l.process(yl);
             yr = self.lp_r.process(yr);
             *xl += (yl - *xl) * self.mix;
@@ -414,7 +496,7 @@ impl BassFx {
         }
     }
 
-    /// Clear filter and envelope state.
+    /// Clear filter, envelope and LFO state.
     pub fn reset(&mut self) {
         self.shelf_l.reset();
         self.shelf_r.reset();
@@ -427,6 +509,7 @@ impl BassFx {
         self.lp_r.reset();
         self.held = [0.0; 2];
         self.env = 0.0;
+        self.lfo_phase = 0.0;
     }
 }
 
@@ -451,6 +534,12 @@ pub struct StereoEq {
     right: [Biquad; MAX_BANDS],
     non_finite: u64,
     bass_fx: BassFx,
+    /// AutoEQ stage (preamp + bands) switch and its wet amount (1 = fully applied). Disabling
+    /// ramps `eq_mix` to 0 over ~10 ms while the filters keep running, so re-enabling is click-free.
+    eq_enabled: bool,
+    eq_mix: f32,
+    eq_dry_l: Box<[f32]>,
+    eq_dry_r: Box<[f32]>,
     /// Wet amount of the bypass crossfade (1 = fully processed).
     wet: f32,
     dry_l: Box<[f32]>,
@@ -473,6 +562,10 @@ impl StereoEq {
             right: [Biquad::identity(); MAX_BANDS],
             non_finite: 0,
             bass_fx: BassFx::new(sample_rate),
+            eq_enabled: true,
+            eq_mix: 1.0,
+            eq_dry_l: vec![0.0; BYPASS_SCRATCH_FRAMES].into_boxed_slice(),
+            eq_dry_r: vec![0.0; BYPASS_SCRATCH_FRAMES].into_boxed_slice(),
             wet: 1.0,
             dry_l: vec![0.0; BYPASS_SCRATCH_FRAMES].into_boxed_slice(),
             dry_r: vec![0.0; BYPASS_SCRATCH_FRAMES].into_boxed_slice(),
@@ -493,11 +586,19 @@ impl StereoEq {
         self.left = other.left;
         self.right = other.right;
         self.bass_fx = other.bass_fx;
+        self.eq_enabled = other.eq_enabled;
+        self.eq_mix = other.eq_mix;
     }
 
-    /// Enable or disable "JBL Bass Mode" and set its intensity (0-100).
-    pub fn set_bass_fx(&mut self, enabled: bool, intensity_pct: u8) {
-        self.bass_fx.set(enabled, intensity_pct);
+    /// Switch the AutoEQ stage (preamp and bands) on or off. Off crossfades just that stage to
+    /// dry over ~10 ms; JBL Bass Mode and the limiter are unaffected.
+    pub fn set_eq_enabled(&mut self, on: bool) {
+        self.eq_enabled = on;
+    }
+
+    /// Enable or disable "JBL Bass Mode", set its intensity (0-100) and stage parameters.
+    pub fn set_bass_fx(&mut self, enabled: bool, intensity_pct: u8, params: &JblParams) {
+        self.bass_fx.set(enabled, intensity_pct, params);
     }
 
     /// Sample rate in Hz.
@@ -588,6 +689,20 @@ impl StereoEq {
             }
         }
         self.non_finite += bad;
+        if self.eq_enabled && self.eq_mix == 1.0 {
+            self.eq_stage(l, r);
+        } else {
+            self.eq_stage_ramped(l, r);
+        }
+        self.bass_fx.process(l, r);
+        if self.limiter {
+            l.iter_mut().for_each(|s| *s = soft_limit(*s));
+            r.iter_mut().for_each(|s| *s = soft_limit(*s));
+        }
+    }
+
+    /// Preamp and band filters, in place.
+    fn eq_stage(&mut self, l: &mut [f32], r: &mut [f32]) {
         let g = self.preamp;
         if g != 1.0 {
             l.iter_mut().for_each(|s| *s *= g);
@@ -599,10 +714,34 @@ impl StereoEq {
         for b in &mut self.right[..self.active] {
             b.process_block(r);
         }
-        self.bass_fx.process(l, r);
-        if self.limiter {
-            l.iter_mut().for_each(|s| *s = soft_limit(*s));
-            r.iter_mut().for_each(|s| *s = soft_limit(*s));
+    }
+
+    /// The EQ stage while `eq_mix` is ramping to, or sitting at, 0: the filters keep running and
+    /// the output crossfades (linear, per sample) between the stage input and output.
+    fn eq_stage_ramped(&mut self, l: &mut [f32], r: &mut [f32]) {
+        let target = if self.eq_enabled { 1.0f32 } else { 0.0 };
+        let step = (1.0 / (BYPASS_RAMP_SECS * self.fs).max(1.0)) as f32;
+        let n = l.len().min(r.len());
+        let mut pos = 0;
+        while pos < n {
+            let end = (pos + BYPASS_SCRATCH_FRAMES).min(n);
+            let (cl, cr) = (&mut l[pos..end], &mut r[pos..end]);
+            pos = end;
+            let len = cl.len();
+            self.eq_dry_l[..len].copy_from_slice(cl);
+            self.eq_dry_r[..len].copy_from_slice(cr);
+            self.eq_stage(cl, cr);
+            let mut w = self.eq_mix;
+            for i in 0..len {
+                if w < target {
+                    w = (w + step).min(target);
+                } else if w > target {
+                    w = (w - step).max(target);
+                }
+                cl[i] = self.eq_dry_l[i] + (cl[i] - self.eq_dry_l[i]) * w;
+                cr[i] = self.eq_dry_r[i] + (cr[i] - self.eq_dry_r[i]) * w;
+            }
+            self.eq_mix = w;
         }
     }
 
@@ -922,12 +1061,73 @@ mod bass_fx_tests {
             .collect()
     }
 
+    /// Deterministic music-like test signals at `rms_db` dBFS RMS (128 BPM kick, sub-bass line,
+    /// pink noise + chord, vocal-like mids). Mirrors the `jbl_audit` harness in `tests/`.
+    fn level_signals(n: usize, fs: f64, rms_db: f64) -> Vec<(&'static str, Vec<f32>)> {
+        let beat = 60.0 / 128.0;
+        let kick = |t: f64| {
+            let tk = t % beat;
+            let ph = 2.0 * PI * (48.0 * tk + 90.0 * (1.0 - (-tk * 40.0).exp()) / 40.0);
+            (-tk * 9.0).exp() * ph.sin()
+        };
+        let vocal = |t: f64| {
+            let f0 = 200.0 * (1.0 + 0.01 * (2.0 * PI * 5.0 * t).sin());
+            (2..=18)
+                .map(|h| {
+                    let f = f0 * h as f64;
+                    let form = |c: f64, w: f64| (-((f - c) / w).powi(2)).exp();
+                    let a = form(700.0, 250.0) + 0.6 * form(1200.0, 300.0) + 0.3 * form(2600.0, 500.0);
+                    a / (h as f64).sqrt() * (2.0 * PI * f * t + h as f64).sin()
+                })
+                .sum::<f64>()
+        };
+        let mut seed = 7u64;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        let notes = [55.0, 55.0, 65.41, 49.0];
+        let mut pink = [0.0f64; 7];
+        let (mut a, mut b, mut c) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        for i in 0..n {
+            let t = i as f64 / fs;
+            let w = noise();
+            pink[0] = 0.99886 * pink[0] + w * 0.0555179;
+            pink[1] = 0.99332 * pink[1] + w * 0.0750759;
+            pink[2] = 0.96900 * pink[2] + w * 0.1538520;
+            pink[3] = 0.86650 * pink[3] + w * 0.3104856;
+            pink[4] = 0.55000 * pink[4] + w * 0.5329522;
+            pink[5] = -0.7616 * pink[5] - w * 0.0168980;
+            let p = pink[..6].iter().sum::<f64>() + pink[6] + w * 0.5362;
+            pink[6] = w * 0.115926;
+            let note = notes[((t / (beat * 4.0)) as usize) % 4];
+            let sub = 0.5 * (2.0 * PI * note * t).sin() * (0.6 + 0.4 * (2.0 * PI * t / beat).sin().abs());
+            let hat = 0.1 * noise() * (-((t + beat / 2.0) % beat) * 60.0).exp();
+            let chord: f64 = [220.0, 261.63, 329.63]
+                .iter()
+                .map(|f| (1..=8).map(|h| (2.0 * PI * f * h as f64 * t).sin() / h as f64).sum::<f64>())
+                .sum();
+            a.push(0.9 * kick(t) + sub + hat);
+            b.push(0.35 * p + 0.12 * chord + 0.4 * (2.0 * PI * 55.0 * t).sin());
+            c.push(0.9 * kick(t) + 0.35 * vocal(t));
+        }
+        let scale = |v: Vec<f64>| -> Vec<f32> {
+            let r = (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
+            let g = 10f64.powf(rms_db / 20.0) / r;
+            v.iter().map(|x| (x * g) as f32).collect()
+        };
+        vec![("kick+sub", scale(a)), ("fullband", scale(b)), ("kick+vox", scale(c))]
+    }
+
+    /// Loudness report: JBL output vs dry at 30/60/80/100 % for the old calibration tone and three
+    /// music-like signals at -18 dBFS RMS (typical programme level after EQ headroom). The mean must
+    /// sit near `BASS_FX_TRIM_DB` (re-calibrate `LEVEL_DB` from this printout when defaults change).
     #[test]
     fn bass_fx_level_report() {
         let fs = 48000.0;
         let n = 96000;
-        // Music-like: 50 Hz kick-ish tone + mid tones + noise-ish highs, ~-12 dBFS RMS.
-        let x: Vec<f32> = (0..n)
+        // Calibration tone: 55 Hz kick-ish + mid tones + highs, ~-18 dBFS RMS.
+        let tone: Vec<f32> = (0..n)
             .map(|i| {
                 let t = i as f64 / fs;
                 let env = (-((t * 2.0) % 1.0) * 6.0).exp();
@@ -937,18 +1137,75 @@ mod bass_fx_tests {
                     + 0.04 * (2.0 * PI * 7000.0 * t).sin()) as f32
             })
             .collect();
+        let mut sigs = level_signals(n, fs, -18.0);
+        sigs.push(("tone", tone));
         let rms = |v: &[f32]| (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
         for pct in [30u8, 60, 80, 100] {
-            let (mut l, mut r) = (x.clone(), x.clone());
-            let mut eq = StereoEq::new(fs);
-            eq.set_limiter(true);
-            eq.set_bass_fx(true, pct);
-            eq.process_stereo(&mut l, &mut r);
-            let db = 20.0 * (rms(&l[n / 2..]) / rms(&x[n / 2..])).log10();
-            println!("LEVEL pct={pct} gain_db={db:.2}");
-            assert!((db - f64::from(BASS_FX_TRIM_DB)).abs() < 1.0, "level drifted at {pct}%: {db:.2} dB");
+            let mut sum = 0.0;
+            for (name, x) in &sigs {
+                let (mut l, mut r) = (x.clone(), x.clone());
+                let mut eq = StereoEq::new(fs);
+                eq.set_limiter(true);
+                eq.set_bass_fx(true, pct, &JblParams::default());
+                eq.process_stereo(&mut l, &mut r);
+                let db = 20.0 * (rms(&l[n / 2..]) / rms(&x[n / 2..])).log10();
+                println!("LEVEL pct={pct} {name} gain_db={db:.2}");
+                assert!((db - f64::from(BASS_FX_TRIM_DB)).abs() < 2.0, "{name} level off at {pct}%: {db:.2} dB");
+                sum += db;
+            }
+            let mean = sum / sigs.len() as f64;
+            println!("LEVEL pct={pct} MEAN gain_db={mean:.2}");
+            assert!((mean - f64::from(BASS_FX_TRIM_DB)).abs() < 0.75, "mean level drifted at {pct}%: {mean:.2} dB");
         }
     }
+
+    /// Deterministic stereo test signal: 55 Hz + 1 kHz sines plus kick-like decaying bursts (R slightly different).
+    fn golden_signal(n: usize, fs: f64) -> (Vec<f32>, Vec<f32>) {
+        let mk = |k: f64| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f64 / fs;
+                    let kick = (-((t * 4.0) % 1.0) * 9.0).exp() * (2.0 * PI * (45.0 + 60.0 * (-((t * 4.0) % 1.0) * 20.0).exp()) * t).sin();
+                    (0.30 * (2.0 * PI * 55.0 * t).sin() + 0.15 * k * (2.0 * PI * 1000.0 * t).sin() + 0.35 * kick) as f32
+                })
+                .collect()
+        };
+        (mk(1.0), mk(0.8))
+    }
+
+    /// Golden regression for the default BassFx sound. Re-captured when the defaults were retuned
+    /// (res_db 9 -> 6, res_q 3 -> 2, drive_max 5 -> 4, plus the `LEVEL_DB` recalibration); it must
+    /// not change from DSP refactors that keep the defaults.
+    #[test]
+    fn bass_fx_golden_default_output() {
+        let fs = 48000.0;
+        let n = 48000;
+        let (x_l, x_r) = golden_signal(n, fs);
+        // (pct, rms_l, rms_r, [l[1000], l[12000], l[30001], r[20000], r[47999]])
+        let golden: [(u8, f64, f64, [f32; 5]); 4] = GOLDEN_VALUES;
+        for (pct, g_rms_l, g_rms_r, g_samples) in golden {
+            let (mut l, mut r) = (x_l.clone(), x_r.clone());
+            let mut eq = StereoEq::new(fs);
+            eq.set_limiter(true);
+            eq.set_bass_fx(true, pct, &JblParams::default());
+            eq.process_stereo(&mut l, &mut r);
+            let rms = |v: &[f32]| (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+            let got = [l[1000], l[12000], l[30001], r[20000], r[47999]];
+            println!("GOLDEN pct={pct} rms_l={:.9} rms_r={:.9} samples={:?}", rms(&l), rms(&r), got);
+            assert!((rms(&l) - g_rms_l).abs() < 1e-6, "rms_l changed at {pct}%: {} vs {g_rms_l}", rms(&l));
+            assert!((rms(&r) - g_rms_r).abs() < 1e-6, "rms_r changed at {pct}%: {} vs {g_rms_r}", rms(&r));
+            for (a, b) in got.iter().zip(g_samples.iter()) {
+                assert!((a - b).abs() < 1e-5, "sample changed at {pct}%: {a} vs {b}");
+            }
+        }
+    }
+
+    const GOLDEN_VALUES: [(u8, f64, f64, [f32; 5]); 4] = [
+        (30, 0.180613230, 0.180478605, [0.17582655, -0.20840953, 0.20334709, -0.24601033, -0.14398156]),
+        (60, 0.123357297, 0.123356423, [0.10713634, -0.14554128, 0.12687653, -0.14801922, -0.14690912]),
+        (80, 0.102350772, 0.102268223, [0.074729785, -0.12072089, 0.09691678, -0.121571034, -0.12072089]),
+        (100, 0.089456323, 0.089219136, [0.06836742, -0.10359563, 0.078125, -0.109375, -0.107421875]),
+    ];
 
     #[test]
     fn bass_fx_off_is_bit_identical() {
@@ -957,11 +1214,207 @@ mod bass_fx_tests {
         let (mut b_l, mut b_r) = (x.clone(), x);
         let mut plain = StereoEq::new(48000.0);
         let mut fx = StereoEq::new(48000.0);
-        fx.set_bass_fx(false, 80);
+        fx.set_bass_fx(false, 80, &JblParams::default());
         plain.process_stereo(&mut a_l, &mut a_r);
         fx.process_stereo(&mut b_l, &mut b_r);
         assert_eq!(a_l, b_l);
         assert_eq!(a_r, b_r);
+    }
+
+    fn run_fx(fs: f64, pct: u8, p: &JblParams, n: usize) -> (Vec<f32>, Vec<f32>) {
+        let (mut l, mut r) = golden_signal(n, fs);
+        let mut eq = StereoEq::new(fs);
+        eq.set_limiter(true);
+        eq.set_bass_fx(true, pct, p);
+        eq.process_stereo(&mut l, &mut r);
+        (l, r)
+    }
+
+    #[test]
+    fn bass_fx_each_toggle_off_removes_its_stage() {
+        let base = run_fx(48000.0, 80, &JblParams::default(), 24000).0;
+        let toggles: [(&str, fn(&mut JblParams)); 6] = [
+            ("duck", |p| p.duck_on = false),
+            ("res", |p| p.res_on = false),
+            ("kick", |p| p.kick_on = false),
+            ("crush", |p| p.crush_on = false),
+            ("hold", |p| p.hold_on = false),
+            ("lpf", |p| p.lpf_on = false),
+        ];
+        for (name, f) in toggles {
+            let mut p = JblParams::default();
+            f(&mut p);
+            let out = run_fx(48000.0, 80, &p, 24000).0;
+            assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 1.0), "{name} not finite/bounded");
+            assert!(out != base, "{name} off should change the output");
+        }
+    }
+
+    #[test]
+    fn bass_fx_lfo_depth_zero_or_off_is_identical() {
+        let base = run_fx(48000.0, 80, &JblParams::default(), 24000);
+        for target in [JblLfoTarget::Gain, JblLfoTarget::BassBand, JblLfoTarget::Both] {
+            let off = JblParams { lfo_on: false, lfo_depth: 0.8, lfo_target: target, ..JblParams::default() };
+            let zero = JblParams { lfo_on: true, lfo_depth: 0.0, lfo_target: target, ..JblParams::default() };
+            assert_eq!(run_fx(48000.0, 80, &off, 24000), base);
+            assert_eq!(run_fx(48000.0, 80, &zero, 24000), base);
+        }
+        let on = JblParams { lfo_on: true, lfo_depth: 0.8, lfo_follow_bass: false, ..JblParams::default() };
+        assert!(run_fx(48000.0, 80, &on, 24000) != base);
+    }
+
+    #[test]
+    fn bass_fx_lfo_modulates_at_set_rate() {
+        let fs = 48000.0;
+        let rate = 6.0;
+        let p = JblParams {
+            lfo_on: true,
+            lfo_depth: 0.9,
+            lfo_rate_hz: rate,
+            lfo_follow_bass: false,
+            lfo_target: JblLfoTarget::Gain,
+            duck_on: false,
+            ..JblParams::default()
+        };
+        // Steady tone, so the output envelope is dominated by the LFO.
+        let n = 96000;
+        let tone: Vec<f32> = (0..n).map(|i| (0.3 * (2.0 * PI * 200.0 * i as f64 / fs).sin()) as f32).collect();
+        let (mut l, mut r) = (tone.clone(), tone);
+        let mut eq = StereoEq::new(fs);
+        eq.set_bass_fx(true, 100, &p);
+        eq.process_stereo(&mut l, &mut r);
+        // Peak envelope per 5 ms window after the wet ramp.
+        let win = 240;
+        let env: Vec<f32> = l[4800..].chunks(win).map(|c| c.iter().fold(0f32, |a, s| a.max(s.abs()))).collect();
+        let mean = env.iter().sum::<f32>() / env.len() as f32;
+        let var = env.iter().map(|e| (e - mean).powi(2)).sum::<f32>();
+        assert!(var > 1e-3, "envelope should wobble, var={var}");
+        // One LFO period = fs/rate samples = 1/6 s = 40 windows: envelope repeats.
+        let period = (fs / f64::from(rate) / win as f64).round() as usize;
+        for k in 0..env.len() - period {
+            assert!((env[k] - env[k + period]).abs() < 0.02, "not periodic at {k}: {} vs {}", env[k], env[k + period]);
+        }
+    }
+
+    #[test]
+    fn bass_fx_lfo_phase_kept_on_configure_cleared_on_reset() {
+        let mut fx = BassFx::new(48000.0);
+        let p = JblParams { lfo_on: true, lfo_depth: 0.5, ..JblParams::default() };
+        fx.set(true, 80, &p);
+        let (mut l, mut r) = (vec![0.1f32; 1000], vec![0.1f32; 1000]);
+        fx.process(&mut l, &mut r);
+        let ph = fx.lfo_phase;
+        assert!(ph > 0.0);
+        fx.set(true, 60, &p);
+        fx.set_sample_rate(96000.0);
+        assert_eq!(fx.lfo_phase, ph);
+        fx.reset();
+        assert_eq!(fx.lfo_phase, 0.0);
+    }
+
+    fn extreme_sets() -> Vec<JblParams> {
+        let lo = JblParams {
+            duck_depth: 0.0,
+            duck_attack_ms: 0.5,
+            duck_release_ms: 10.0,
+            detect_hz: 40.0,
+            shelf_hz: 30.0,
+            shelf_db: 0.0,
+            res_hz: 25.0,
+            res_db: 0.0,
+            res_q: 0.5,
+            drive_max: 1.0,
+            bias_max: 0.0,
+            kick_hz: 60.0,
+            kick_drive_max: 1.0,
+            crush_bits_min: 16.0,
+            hold_max: 1.0,
+            lpf_hz_start: 2000.0,
+            lpf_hz_end: 2000.0,
+            lfo_on: true,
+            lfo_rate_hz: 0.5,
+            lfo_depth: 0.0,
+            out_trim_db: -12.0,
+            ..JblParams::default()
+        };
+        let hi = JblParams {
+            duck_depth: 6.0,
+            duck_attack_ms: 50.0,
+            duck_release_ms: 800.0,
+            detect_hz: 250.0,
+            shelf_hz: 200.0,
+            shelf_db: 18.0,
+            res_hz: 120.0,
+            res_db: 18.0,
+            res_q: 10.0,
+            drive_max: 12.0,
+            bias_max: 0.8,
+            kick_hz: 300.0,
+            kick_drive_max: 6.0,
+            crush_bits_min: 6.0,
+            hold_max: 8.0,
+            lpf_hz_start: 20000.0,
+            lpf_hz_end: 2000.0,
+            lfo_on: true,
+            lfo_rate_hz: 20.0,
+            lfo_depth: 1.0,
+            lfo_follow_bass: false,
+            lfo_target: JblLfoTarget::Both,
+            out_trim_db: 6.0,
+            ..JblParams::default()
+        };
+        let swapped = JblParams { lpf_hz_start: 2000.0, lpf_hz_end: 20000.0, ..hi };
+        let junk = JblParams {
+            duck_depth: f32::NAN,
+            res_q: f32::INFINITY,
+            shelf_hz: -5.0,
+            lfo_rate_hz: f32::NAN,
+            lfo_depth: 1e9,
+            out_trim_db: f32::NEG_INFINITY,
+            hold_max: -3.0,
+            ..hi
+        };
+        vec![lo, hi, swapped, junk]
+    }
+
+    #[test]
+    fn bass_fx_extreme_params_finite_and_bounded_at_all_rates() {
+        for fs in [44100.0, 96000.0, 192000.0] {
+            for (k, p) in extreme_sets().iter().enumerate() {
+                for pct in [0u8, 1, 50, 100] {
+                    let (l, r) = run_fx(fs, pct, p, 19200);
+                    assert!(
+                        l.iter().chain(r.iter()).all(|s| s.is_finite() && s.abs() <= 1.0),
+                        "non-finite/unbounded: fs={fs} set={k} pct={pct}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bass_fx_sample_rate_change_with_effect_on() {
+        let p = JblParams { lfo_on: true, lfo_follow_bass: false, ..JblParams::default() };
+        let mut eq = StereoEq::new(48000.0);
+        eq.set_limiter(true);
+        eq.set_bass_fx(true, 100, &p);
+        for fs in [48000.0, 192000.0, 44100.0, 96000.0] {
+            eq.set_sample_rate(fs);
+            let (mut l, mut r) = golden_signal(9600, fs);
+            eq.process_stereo(&mut l, &mut r);
+            assert!(l.iter().chain(r.iter()).all(|s| s.is_finite() && s.abs() <= 1.0), "fs={fs}");
+        }
+        // Params survive the rate change: result at 44.1k equals a fresh effect configured there.
+        let mut a = StereoEq::new(48000.0);
+        a.set_bass_fx(true, 70, &p);
+        a.set_sample_rate(44100.0);
+        let mut b = StereoEq::new(44100.0);
+        b.set_bass_fx(true, 70, &p);
+        let (mut al, mut ar) = golden_signal(4410, 44100.0);
+        let (mut bl, mut br) = (al.clone(), ar.clone());
+        a.process_stereo(&mut al, &mut ar);
+        b.process_stereo(&mut bl, &mut br);
+        assert_eq!(al, bl);
     }
 
     #[test]
@@ -970,7 +1423,7 @@ mod bass_fx_tests {
         let (mut l, mut r) = (x.clone(), x.clone());
         let mut eq = StereoEq::new(48000.0);
         eq.set_limiter(true);
-        eq.set_bass_fx(true, 100);
+        eq.set_bass_fx(true, 100, &JblParams::default());
         eq.process_stereo(&mut l, &mut r);
         assert!(l.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
         let diff: f32 = l.iter().zip(&x).map(|(a, b)| (a - b).abs()).sum();
@@ -1221,6 +1674,76 @@ mod tests {
         let mut r = l.clone();
         eq.process_stereo_with_bypass_ramp(&mut l, &mut r, false);
         assert!((l[big - 1] - wet).abs() < 1e-4);
+    }
+
+    #[test]
+    fn eq_enabled_off_ramps_to_dry_and_back_click_free() {
+        let fs = 48000.0;
+        let wet = 0.5 * 10f32.powf(-6.0 / 20.0);
+        let mut eq = StereoEq::new(fs);
+        eq.set_profile(&EqProfile {
+            name: String::new(),
+            preamp_db: -6.0,
+            filters: vec![spec(FilterKind::Peaking, 1000.0, 0.0, 1.0)],
+        });
+        let n = 4800;
+        let run = |eq: &mut StereoEq| {
+            let mut l = vec![0.5f32; n];
+            let mut r = l.clone();
+            eq.process_stereo(&mut l, &mut r);
+            l
+        };
+        assert!((run(&mut eq)[n - 1] - wet).abs() < 1e-4, "enabled by default");
+        eq.set_eq_enabled(false);
+        let l = run(&mut eq);
+        assert!(l.windows(2).all(|w| w[1] >= w[0] - 1e-6), "monotonic to dry");
+        assert!(l.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-3), "no step");
+        assert!((l[0] - wet).abs() < 0.01);
+        assert!((l[n - 1] - 0.5).abs() < 1e-6, "fully dry once ramped");
+        assert!((run(&mut eq)[0] - 0.5).abs() < 1e-6, "stays dry");
+        eq.set_eq_enabled(true);
+        let l = run(&mut eq);
+        assert!(l.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-3), "no step back");
+        assert!((l[n - 1] - wet).abs() < 1e-4, "EQ applied again");
+        // A block larger than the scratch buffer works too.
+        eq.set_eq_enabled(false);
+        let big = BYPASS_SCRATCH_FRAMES * 2 + 10;
+        let mut l = vec![0.5f32; big];
+        let mut r = l.clone();
+        eq.process_stereo(&mut l, &mut r);
+        assert!((l[big - 1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn eq_disabled_leaves_jbl_bass_mode_and_limiter_working() {
+        let fs = 48000.0;
+        let params = JblParams::default();
+        let sig = |n: usize| -> Vec<f32> {
+            (0..n).map(|i| 0.4 * (std::f32::consts::TAU * 55.0 * i as f32 / fs as f32).sin()).collect()
+        };
+        let mut eq = StereoEq::new(fs);
+        eq.set_profile(&EqProfile {
+            name: String::new(),
+            preamp_db: -6.0,
+            filters: vec![spec(FilterKind::LowShelf, 100.0, 6.0, 0.7)],
+        });
+        eq.set_eq_enabled(false);
+        eq.set_limiter(true);
+        // Let the EQ ramp finish, then compare with Bass Mode off and on.
+        let warm = 4800;
+        let (mut wl, mut wr) = (sig(warm), sig(warm));
+        eq.process_stereo(&mut wl, &mut wr);
+        let n = 9600;
+        let (mut off_l, mut off_r) = (sig(n), sig(n));
+        eq.process_stereo(&mut off_l, &mut off_r);
+        let dry = sig(n);
+        assert!(off_l.iter().zip(&dry).all(|(a, b)| (a - b).abs() < 1e-6), "EQ off and Bass Mode off is dry");
+        eq.set_bass_fx(true, 80, &params);
+        let (mut on_l, mut on_r) = (sig(n), sig(n));
+        eq.process_stereo(&mut on_l, &mut on_r);
+        let diff = on_l.iter().zip(&dry).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(diff > 0.05, "Bass Mode still shapes the signal with the EQ disabled: {diff}");
+        assert!(on_l.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
     }
 
     #[test]

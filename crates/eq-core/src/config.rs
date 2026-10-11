@@ -138,6 +138,10 @@ pub struct Config {
     pub passthrough_inputs: bool,
     /// Bypass the EQ entirely.
     pub bypass: bool,
+    /// Apply the AutoEQ stage (preamp and bands). Off crossfades just that stage to dry; unlike
+    /// `bypass`, JBL Bass Mode and the limiter keep working.
+    #[serde(default = "default_true")]
+    pub eq_enabled: bool,
     /// Enable the soft limiter after the EQ.
     pub limiter: bool,
     /// Where the profile came from (e.g. a file path), informational.
@@ -201,6 +205,153 @@ pub struct Config {
     /// JBL Bass Mode intensity, 0..=100.
     #[serde(default = "default_jbl_intensity")]
     pub jbl_intensity: u8,
+    /// Advanced JBL Bass Mode parameters (at-100 % endpoints; Intensity stays the master scaler).
+    #[serde(default)]
+    pub jbl: JblParams,
+}
+
+/// What the rattle LFO modulates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum JblLfoTarget {
+    /// Final output gain.
+    #[default]
+    Gain,
+    /// Level of the kick band feeding the saturator.
+    BassBand,
+    /// Both of the above.
+    Both,
+}
+
+/// Advanced JBL Bass Mode settings. Values are the at-100 % endpoints; the existing
+/// `jbl_intensity / 100` scaling interpolates from idle. `Default` is the measured, tuned set
+/// (see `tests/jbl_audit.rs`); a saved `[jbl]` table keeps whatever values it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JblParams {
+    // Pump / duck
+    pub duck_on: bool,
+    /// Duck depth (0..=6, default 2.0).
+    pub duck_depth: f32,
+    /// Duck attack ms (0.5..=50, default 5).
+    pub duck_attack_ms: f32,
+    /// Duck release ms (10..=800, default 120).
+    pub duck_release_ms: f32,
+    /// Bass detector frequency Hz (40..=250, default 100).
+    pub detect_hz: f32,
+    // Low end
+    /// Low-shelf frequency Hz (30..=200, default 70).
+    pub shelf_hz: f32,
+    /// Low-shelf gain dB (0..=18, default 12).
+    pub shelf_db: f32,
+    pub res_on: bool,
+    /// Resonance frequency Hz (25..=120, default 50).
+    pub res_hz: f32,
+    /// Resonance gain dB (0..=18, default 6).
+    pub res_db: f32,
+    /// Resonance Q (0.5..=10, default 2).
+    pub res_q: f32,
+    // Distortion
+    /// Max drive (1..=12, default 4).
+    pub drive_max: f32,
+    /// Max asymmetric bias (0..=0.8, default 0.35).
+    pub bias_max: f32,
+    pub kick_on: bool,
+    /// Kick band frequency Hz (60..=300, default 130).
+    pub kick_hz: f32,
+    /// Max kick drive (1..=6, default 2.2).
+    pub kick_drive_max: f32,
+    // Lo-fi
+    pub crush_on: bool,
+    /// Bit depth at 100 % (6..=16, default 10).
+    pub crush_bits_min: f32,
+    pub hold_on: bool,
+    /// Max sample-hold factor (1..=8, default 3).
+    pub hold_max: f32,
+    pub lpf_on: bool,
+    /// LPF cutoff at 0 % Hz (2000..=20000, default 14000).
+    pub lpf_hz_start: f32,
+    /// LPF cutoff at 100 % Hz (2000..=20000, default 7500).
+    pub lpf_hz_end: f32,
+    // Rattle LFO
+    pub lfo_on: bool,
+    /// LFO rate Hz (0.5..=20, default 6).
+    pub lfo_rate_hz: f32,
+    /// LFO depth (0..=1, default 0.3).
+    pub lfo_depth: f32,
+    /// Scale LFO depth by the bass envelope so it only wobbles on hits.
+    pub lfo_follow_bass: bool,
+    pub lfo_target: JblLfoTarget,
+    // Output
+    /// Extra output trim dB (-12..=6, default 0).
+    pub out_trim_db: f32,
+}
+
+impl Default for JblParams {
+    fn default() -> Self {
+        JblParams {
+            duck_on: true,
+            duck_depth: 2.0,
+            duck_attack_ms: 5.0,
+            duck_release_ms: 120.0,
+            detect_hz: 100.0,
+            shelf_hz: 70.0,
+            shelf_db: 12.0,
+            res_on: true,
+            res_hz: 50.0,
+            res_db: 6.0,
+            res_q: 2.0,
+            drive_max: 4.0,
+            bias_max: 0.35,
+            kick_on: true,
+            kick_hz: 130.0,
+            kick_drive_max: 2.2,
+            crush_on: true,
+            crush_bits_min: 10.0,
+            hold_on: true,
+            hold_max: 3.0,
+            lpf_on: true,
+            lpf_hz_start: 14000.0,
+            lpf_hz_end: 7500.0,
+            lfo_on: false,
+            lfo_rate_hz: 6.0,
+            lfo_depth: 0.3,
+            lfo_follow_bass: true,
+            lfo_target: JblLfoTarget::Gain,
+            out_trim_db: 0.0,
+        }
+    }
+}
+
+impl JblParams {
+    /// Clamps every field to its range; NaN/inf become the default. `lpf_hz_start`/`lpf_hz_end`
+    /// are each clamped independently (either ordering is safe).
+    pub fn sanitized(self) -> Self {
+        let d = JblParams::default();
+        let c = |v: f32, dv: f32, lo: f32, hi: f32| if v.is_finite() { v.clamp(lo, hi) } else { dv };
+        JblParams {
+            duck_depth: c(self.duck_depth, d.duck_depth, 0.0, 6.0),
+            duck_attack_ms: c(self.duck_attack_ms, d.duck_attack_ms, 0.5, 50.0),
+            duck_release_ms: c(self.duck_release_ms, d.duck_release_ms, 10.0, 800.0),
+            detect_hz: c(self.detect_hz, d.detect_hz, 40.0, 250.0),
+            shelf_hz: c(self.shelf_hz, d.shelf_hz, 30.0, 200.0),
+            shelf_db: c(self.shelf_db, d.shelf_db, 0.0, 18.0),
+            res_hz: c(self.res_hz, d.res_hz, 25.0, 120.0),
+            res_db: c(self.res_db, d.res_db, 0.0, 18.0),
+            res_q: c(self.res_q, d.res_q, 0.5, 10.0),
+            drive_max: c(self.drive_max, d.drive_max, 1.0, 12.0),
+            bias_max: c(self.bias_max, d.bias_max, 0.0, 0.8),
+            kick_hz: c(self.kick_hz, d.kick_hz, 60.0, 300.0),
+            kick_drive_max: c(self.kick_drive_max, d.kick_drive_max, 1.0, 6.0),
+            crush_bits_min: c(self.crush_bits_min, d.crush_bits_min, 6.0, 16.0),
+            hold_max: c(self.hold_max, d.hold_max, 1.0, 8.0),
+            lpf_hz_start: c(self.lpf_hz_start, d.lpf_hz_start, 2000.0, 20000.0),
+            lpf_hz_end: c(self.lpf_hz_end, d.lpf_hz_end, 2000.0, 20000.0),
+            lfo_rate_hz: c(self.lfo_rate_hz, d.lfo_rate_hz, 0.5, 20.0),
+            lfo_depth: c(self.lfo_depth, d.lfo_depth, 0.0, 1.0),
+            out_trim_db: c(self.out_trim_db, d.out_trim_db, -12.0, 6.0),
+            ..self
+        }
+    }
 }
 
 fn default_jbl_intensity() -> u8 {
@@ -214,6 +365,7 @@ impl Default for Config {
             output_channels: [0, 1],
             passthrough_inputs: true,
             bypass: false,
+            eq_enabled: true,
             limiter: true,
             profile_source: None,
             profile: EqProfile::default(),
@@ -233,6 +385,7 @@ impl Default for Config {
             source_preset: SourcePreset::Cable,
             jbl_bass_mode: false,
             jbl_intensity: default_jbl_intensity(),
+            jbl: JblParams::default(),
         }
     }
 }
@@ -358,6 +511,7 @@ impl Config {
             default_safety_ms()
         };
         c.jbl_intensity = c.jbl_intensity.min(100);
+        c.jbl = c.jbl.sanitized();
         c.jitter_margin_ms = if c.jitter_margin_ms.is_finite() { c.jitter_margin_ms.clamp(0.0, 40.0) } else { 0.0 };
         c.capture_period_ms = if !c.capture_period_ms.is_finite() || c.capture_period_ms <= 0.0 {
             0.0
@@ -436,6 +590,61 @@ mod tests {
         let d = std::env::temp_dir().join(format!("eq_core_test_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn jbl_toml_round_trip() {
+        let mut c = Config::default();
+        c.jbl.duck_depth = 3.5;
+        c.jbl.lfo_on = true;
+        c.jbl.lfo_target = JblLfoTarget::Both;
+        c.jbl.out_trim_db = -3.0;
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("[jbl]"));
+        let back = Config::from_toml_str(&text).unwrap();
+        assert_eq!(back.jbl, c.jbl);
+    }
+
+    #[test]
+    fn jbl_old_toml_loads_defaults() {
+        let c = Config::from_toml_str("jbl_bass_mode = true\njbl_intensity = 55\n").unwrap();
+        assert_eq!(c.jbl, JblParams::default());
+        assert_eq!(c.jbl_intensity, 55);
+        let p = Config::from_toml_str("[jbl]\nduck_depth = 4.0\n").unwrap();
+        assert_eq!(p.jbl.duck_depth, 4.0);
+        assert_eq!(p.jbl.shelf_hz, 70.0);
+    }
+
+    #[test]
+    fn eq_enabled_defaults_on_and_round_trips() {
+        assert!(Config::default().eq_enabled);
+        assert!(Config::from_toml_str("bypass = true\n").unwrap().eq_enabled, "old files keep the EQ on");
+        let c = Config::from_toml_str("eq_enabled = false\n").unwrap();
+        assert!(!c.eq_enabled);
+        let back = Config::from_toml_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert!(!back.eq_enabled);
+    }
+
+    #[test]
+    fn jbl_sanitized_clamps_and_replaces_nan() {
+        let mut c = Config::default();
+        c.jbl.duck_depth = 99.0;
+        c.jbl.res_q = f32::NAN;
+        c.jbl.shelf_hz = f32::INFINITY;
+        c.jbl.out_trim_db = -100.0;
+        c.jbl.lpf_hz_start = 1.0;
+        c.jbl.lpf_hz_end = 1e9;
+        c.jbl.lfo_depth = -1.0;
+        let s = c.sanitized().jbl;
+        let d = JblParams::default();
+        assert_eq!(s.duck_depth, 6.0);
+        assert_eq!(s.res_q, d.res_q);
+        assert_eq!(s.shelf_hz, d.shelf_hz);
+        assert_eq!(s.out_trim_db, -12.0);
+        assert_eq!(s.lpf_hz_start, 2000.0);
+        assert_eq!(s.lpf_hz_end, 20000.0);
+        assert_eq!(s.lfo_depth, 0.0);
+        assert_eq!(JblParams::default().sanitized(), JblParams::default());
     }
 
     #[test]

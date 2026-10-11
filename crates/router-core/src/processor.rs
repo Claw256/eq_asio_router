@@ -16,12 +16,16 @@
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 
-use eq_core::{auto_headroom_db, Config, EqProfile, FaultDetector, FaultState, GainRamp, StereoEq, BYPASS_SCRATCH_FRAMES};
+use eq_core::{
+    auto_headroom_db, Config, EqProfile, FaultDetector, FaultState, GainRamp, JblParams, StereoEq, BYPASS_SCRATCH_FRAMES,
+};
 
 /// Realtime-relevant settings derived from a [`Config`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub bypass: bool,
+    /// AutoEQ stage (preamp and bands) on; JBL Bass Mode and the limiter are unaffected.
+    pub eq_enabled: bool,
     pub limiter: bool,
     /// Fade-mute the output while the fault detector reports `Muted`.
     pub mute_on_fault: bool,
@@ -33,19 +37,24 @@ pub struct Settings {
     /// "JBL Bass Mode" on/off and intensity (0..=100).
     pub jbl_bass_mode: bool,
     pub jbl_intensity: u8,
+    /// Detailed JBL Bass Mode stage parameters.
+    pub jbl: JblParams,
 }
 
 impl Default for Settings {
     fn default() -> Self {
+        let c = Config::default();
         Settings {
             bypass: false,
+            eq_enabled: true,
             limiter: true,
             mute_on_fault: true,
             auto_headroom: true,
             outputs: [0, 1],
             passthrough_inputs: true,
-            jbl_bass_mode: false,
-            jbl_intensity: 80,
+            jbl_bass_mode: c.jbl_bass_mode,
+            jbl_intensity: c.jbl_intensity,
+            jbl: c.jbl,
         }
     }
 }
@@ -65,6 +74,7 @@ impl Settings {
     pub fn from_config(cfg: &Config, n_out: usize) -> Self {
         Settings {
             bypass: cfg.bypass,
+            eq_enabled: cfg.eq_enabled,
             limiter: cfg.limiter,
             mute_on_fault: cfg.mute_on_fault,
             auto_headroom: cfg.auto_headroom,
@@ -72,6 +82,7 @@ impl Settings {
             passthrough_inputs: cfg.passthrough_inputs,
             jbl_bass_mode: cfg.jbl_bass_mode,
             jbl_intensity: cfg.jbl_intensity,
+            jbl: cfg.jbl,
         }
     }
 }
@@ -248,7 +259,8 @@ impl EqProcessor {
         eq.set_profile(&snap.profile);
         eq.set_extra_gain_db(snap.extra_gain_db);
         eq.set_limiter(snap.settings.limiter);
-        eq.set_bass_fx(snap.settings.jbl_bass_mode, snap.settings.jbl_intensity);
+        eq.set_eq_enabled(snap.settings.eq_enabled);
+        eq.set_bass_fx(snap.settings.jbl_bass_mode, snap.settings.jbl_intensity, &snap.settings.jbl);
         EqProcessor {
             eq,
             old_eq: StereoEq::new(sample_rate),
@@ -321,7 +333,8 @@ impl EqProcessor {
             self.eq.set_profile(&snap.profile);
             self.eq.set_extra_gain_db(snap.extra_gain_db);
             self.eq.set_limiter(snap.settings.limiter);
-            self.eq.set_bass_fx(snap.settings.jbl_bass_mode, snap.settings.jbl_intensity);
+            self.eq.set_eq_enabled(snap.settings.eq_enabled);
+            self.eq.set_bass_fx(snap.settings.jbl_bass_mode, snap.settings.jbl_intensity, &snap.settings.jbl);
             if was_bypassed && !snap.settings.bypass {
                 self.eq.reset(); // state is stale after a bypassed stretch
             }

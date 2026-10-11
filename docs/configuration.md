@@ -23,7 +23,8 @@ All values are passed through `Config::sanitized()`; out-of-range numbers are cl
 | `master_driver` | string | `""` (= `Yamaha Steinberg USB ASIO`) | Name of the ASIO driver to host. `EQ ASIO Router` (frozen v1 driver) is refused | any non-empty name, else default |
 | `output_channels` | `[u32, u32]` | `[0, 1]` | Master output channel indexes that receive the stereo pair | both must exist and differ, else `[0, 1]` |
 | `passthrough_inputs` | bool | `true` | From the v1 driver. Carried into the processor settings, but the router creates output buffers only, so it has no audible effect | |
-| `bypass` | bool | `false` | Bypass the EQ (live) | |
+| `bypass` | bool | `false` | Bypass the whole chain, AutoEQ and JBL Bass Mode (live) | |
+| `eq_enabled` | bool | `true` | Apply the AutoEQ stage (preamp and bands). `false` crossfades only that stage to dry over ~10 ms (live); JBL Bass Mode and the limiter keep working | |
 | `limiter` | bool | `true` | Soft limiter after the EQ, knee about -1 dBFS (live) | |
 | `profile_source` | string, optional | absent | Where the profile came from (informational) | |
 | `profile` | table | empty | Active EQ profile: `name`, `preamp_db`, `[[profile.filters]]` | see below |
@@ -79,6 +80,56 @@ Status fields (in `EngineStatus`, not in the 128-byte status block, which is unc
 | `source_preset` | Preset label of the config in force |
 
 `capture_mode` in `config.toml` stays `shared`, `lowlatency` or `exclusive`; fixed-period capture is not a config value but the result of `capture_period_ms > 0` in Shared mode on a known virtual cable (it shows up as capture mode in use "fixed-period (IAudioClient3)"). Never use `lowlatency` on VAC (the capture layer refuses an IAudioClient3 minimum below 2.5 ms unless forced in a lab tool). VAC endpoints are never touched by `match_cable_rate`: only VB-Audio cable names count as cables to match (`is_vb_cable_name`).
+
+### JBL Bass Mode
+
+`jbl_bass_mode` (bool, default `false`) turns the car-subwoofer effect on (bass shelf, resonance, clipping distortion, bass-keyed pumping, lo-fi) after the EQ. `jbl_intensity` (0..100, default 80) is the master scaler. The `[jbl]` table exposes the individual stages. Every value in it is the endpoint reached at 100 % Intensity; lower Intensity interpolates from the idle (neutral) value toward it. The defaults were tuned against measurements (see `crates/eq-core/tests/jbl_audit.rs`): the pump depth, release and attack sit in the usual sidechain ranges, and the resonance is a broad box-like boost rather than a narrow ring. A missing `[jbl]` table or key uses the default. Out-of-range values are clamped by `Config::sanitized()`; NaN/infinity becomes the default. Configs saved by an earlier version carry their old explicit `[jbl]` values (previous defaults: `res_db = 9.0`, `res_q = 3.0`, `drive_max = 5.0`); delete those keys or use "Reset to defaults" to adopt the new ones. All changes apply live.
+
+| Key | Default | Range | Meaning |
+|---|---|---|---|
+| `duck_on` | `true` | | Pumping: lower the level on each bass hit |
+| `duck_depth` | `2.0` | 0..6 | How far the level is pulled down |
+| `duck_attack_ms` | `5.0` | 0.5..50 | Duck attack time |
+| `duck_release_ms` | `120.0` | 10..800 | Duck release time |
+| `detect_hz` | `100.0` | 40..250 | Bass detector frequency that triggers the pumping |
+| `shelf_hz` | `70.0` | 30..200 | Low-shelf corner frequency |
+| `shelf_db` | `12.0` | 0..18 | Low-shelf boost |
+| `res_on` | `true` | | Enable the resonant boom |
+| `res_hz` | `50.0` | 25..120 | Resonance centre frequency |
+| `res_db` | `6.0` | 0..18 | Resonance gain |
+| `res_q` | `2.0` | 0.5..10 | Resonance Q (higher is narrower) |
+| `drive_max` | `4.0` | 1..12 | Clipping drive |
+| `bias_max` | `0.35` | 0..0.8 | Clipping asymmetry (adds even harmonics) |
+| `kick_on` | `true` | | Enable the extra kick-band saturation |
+| `kick_hz` | `130.0` | 60..300 | Kick band upper edge |
+| `kick_drive_max` | `2.2` | 1..6 | Kick-band drive |
+| `crush_on` | `true` | | Enable the bit crusher |
+| `crush_bits_min` | `10.0` | 6..16 | Bit depth at 100 % |
+| `hold_on` | `true` | | Enable sample hold |
+| `hold_max` | `3.0` | 1..8 | Hold length at 100 % |
+| `lpf_on` | `true` | | Enable the treble low-pass |
+| `lpf_hz_start` | `14000.0` | 2000..20000 | Low-pass cutoff at low Intensity |
+| `lpf_hz_end` | `7500.0` | 2000..20000 | Low-pass cutoff at 100 % |
+| `lfo_on` | `false` | | Enable the rattle LFO (slow level wobble) |
+| `lfo_rate_hz` | `6.0` | 0.5..20 | LFO rate |
+| `lfo_depth` | `0.3` | 0..1 | LFO depth (0 = no effect) |
+| `lfo_follow_bass` | `true` | | Scale the LFO by the bass envelope so it only wobbles on hits |
+| `lfo_target` | `"Gain"` | `"Gain"`, `"BassBand"`, `"Both"` | Modulate output gain, the kick band level, or both |
+| `out_trim_db` | `0.0` | -12..+6 | Output trim, added to the automatic loudness compensation |
+
+Example:
+
+```toml
+jbl_bass_mode = true
+jbl_intensity = 80
+
+[jbl]
+shelf_hz = 60.0
+lfo_on = true
+lfo_target = "Both"
+```
+
+The GUI shows these under Fun > Advanced (greyed out while the mode is off), with a "Reset to defaults" button.
 
 ## 3. `app_settings.toml`
 

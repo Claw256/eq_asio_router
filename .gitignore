@@ -19,3 +19,9 @@ __pycache__/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Rust leftovers
+**/*.rs.bk
+
+# Claude Code local state
+.claude/settings.local.json

@@ -634,9 +634,11 @@ impl eframe::App for App {
             });
         });
         egui::CentralPanel::default().show(ui, |ui| {
-            panels::eq::ui(ui, self);
-            ui.separator();
-            panels::fun::ui(ui, self);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                panels::eq::ui(ui, self);
+                ui.separator();
+                panels::fun::ui(ui, self);
+            });
         });
         self.close_dialog(&ctx);
         panels::source::confirm_dialog(&ctx, self);

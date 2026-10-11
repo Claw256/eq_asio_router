@@ -28,7 +28,14 @@ pub fn ui(ui: &mut egui::Ui, app: &mut App) {
         if ui.button("Save profile as text…").clicked() {
             save_file(app);
         }
-        other_changed |= ui.checkbox(&mut app.cfg.bypass, "Bypass").changed();
+        other_changed |= ui
+            .checkbox(&mut app.cfg.eq_enabled, "AutoEQ enabled")
+            .on_hover_text("Turn the AutoEQ preamp and bands on or off. JBL Bass Mode and the limiter keep working.")
+            .changed();
+        other_changed |= ui
+            .checkbox(&mut app.cfg.bypass, "Bypass")
+            .on_hover_text("Skip everything (AutoEQ and JBL Bass Mode) and pass the audio through untouched.")
+            .changed();
     });
     if let Some(e) = &app.eq_error {
         ui.colored_label(egui::Color32::LIGHT_RED, e);
@@ -55,7 +62,8 @@ pub fn ui(ui: &mut egui::Ui, app: &mut App) {
     ));
 
     ui.add_space(4.0);
-    let plot_h = (ui.available_height() * 0.45).max(200.0);
+    // Sized from the window, not `available_height()`, which is unbounded inside the panel's scroll area.
+    let plot_h = (ui.ctx().content_rect().height() * 0.4).max(200.0);
     ui.allocate_ui(egui::vec2(ui.available_width(), plot_h), |ui| {
         plot::show(ui, &app.response);
     });
