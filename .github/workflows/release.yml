@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p eq-asio-app -p router-cli
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/eq-asio-app.exe, target/release/router-cli.exe, LICENSE, README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath "eq_asio_router-${{ github.ref_name }}-windows-x64.zip"
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: eq_asio_router-*-windows-x64.zip
+          generate_release_notes: false
