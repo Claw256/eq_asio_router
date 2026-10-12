@@ -223,11 +223,11 @@ dependencies = [
 
 [[package]]
 name = "asio-abi"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "asio-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asio-abi",
  "thiserror 2.0.21",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "asio-probe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "asio-abi",
@@ -972,7 +972,7 @@ checksum = "773fa9c96dd0dbef887e39d0ed6177f141cce4d68e6041df77570aa3702dfa13"
 
 [[package]]
 name = "eq-asio-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asio-host",
  "eframe",
@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "eq-asio-driver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asio-abi",
  "asio-host",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "eq-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -2494,7 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "router-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "asio-host",
@@ -2507,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "router-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asio-abi",
  "eq-core",
@@ -2516,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "router-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asio-abi",
  "asio-host",
@@ -3135,7 +3135,7 @@ dependencies = [
 
 [[package]]
 name = "wasapi-capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.21",
  "windows",
