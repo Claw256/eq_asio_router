@@ -49,15 +49,37 @@ fn advanced(ui: &mut egui::Ui, p: &mut JblParams, intensity: &mut u8) -> bool {
             "Lowers the whole signal on every bass hit, then lets it swell back, like a straining amplifier.",
         );
         c |= slider(ui, &mut p.duck_depth, 0.0..=6.0, "Depth", "", false, "How hard the level is pulled down on a bass hit. 0 = none.");
+        c |= ui
+            .add(egui::Slider::new(&mut p.duck_floor_db, -24.0..=0.0).text("Floor").custom_formatter(|v, _| {
+                if v <= -23.95 { "none".to_owned() } else { format!("{v:.1} dB") }
+            }))
+            .on_hover_text(
+                "How far the level is allowed to drop on a bass hit. Higher = louder during the pumping (shallower dips,                  same timing and rhythm). 0 dB = no dip at all, none = the full, uncapped dip.",
+            )
+            .changed();
         c |= slider(ui, &mut p.duck_attack_ms, 0.5..=50.0, "Attack", " ms", true, "How fast the level drops when bass hits. Short = punchy.");
         c |= slider(ui, &mut p.duck_release_ms, 10.0..=800.0, "Release", " ms", true, "How slowly the level recovers after a hit. Long = more audible pumping.");
         c |= hz(ui, &mut p.detect_hz, 40.0..=250.0, "Detect", "Frequency below which sound counts as bass and triggers the pumping.");
         c
     });
 
+    c |= group(ui, "Mids/highs", |ui| {
+        let mut c = ui
+            .add(egui::Slider::new(&mut p.mid_pass, 0.0..=1.0).text("Pass-through").custom_formatter(|v, _| format!("{:.0} %", v * 100.0)).custom_parser(|t| {
+                t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0)
+            }))
+            .on_hover_text(
+                "How much of the original sound above the crossover is let through unprocessed. Low = the distortion, lo-fi, dulling and pumping hit the whole sound and the bass takes over (the default is low, 15 %). High = vocals and highs stay clean while only the bass distorts. 0 % = everything is processed.",
+            )
+            .changed();
+        c |= hz(ui, &mut p.mid_pass_hz, 100.0..=1000.0, "Crossover", "Frequency above which the original sound is kept. Lower = more of the low-mids stay clean; higher = more of the bass harmonics stay distorted.");
+        c
+    });
+
     c |= group(ui, "Low end", |ui| {
         let mut c = hz(ui, &mut p.shelf_hz, 30.0..=200.0, "Shelf", "Corner frequency of the bass boost. Everything below it is lifted.");
         c |= slider(ui, &mut p.shelf_db, 0.0..=18.0, "Shelf gain", " dB", false, "How much the bass is lifted below the shelf frequency.");
+        c |= hz(ui, &mut p.bass_boost_hz, 30.0..=200.0, "Boost freq", "Corner frequency of the Bass boost slider. Everything below it gets the extra clean gain.");
         c |= toggle(ui, &mut p.res_on, "Resonance", "Adds a narrow boom at one low frequency, like a ported enclosure.");
         c |= hz(ui, &mut p.res_hz, 25.0..=120.0, "Resonance freq", "Centre frequency of the boom.");
         c |= slider(ui, &mut p.res_db, 0.0..=18.0, "Resonance gain", " dB", false, "How loud the boom is.");
@@ -112,15 +134,28 @@ fn advanced(ui: &mut egui::Ui, p: &mut JblParams, intensity: &mut u8) -> bool {
     });
 
     c |= group(ui, "Output", |ui| {
-        slider(
+        let mut c = slider(
             ui,
             &mut p.out_trim_db,
-            -12.0..=6.0,
+            -12.0..=12.0,
             "Trim",
             " dB",
             false,
-            "Final volume adjustment on top of the automatic loudness compensation. Use it if your settings get too loud or quiet.",
-        )
+            "Final volume adjustment on top of the automatic loudness compensation. The default sound lands about 1 dB below the original volume at any input level; 0 dB here keeps that.",
+        );
+        c |= toggle(
+            ui,
+            &mut p.auto_level,
+            "Auto level",
+            "Makes Bass Mode sound the same at any volume: it follows how loud the music is, so the distortion, pump and bass boom stay the same and the output stays about as loud as the original (just under it). Turn it off for the older behaviour, where loud music got quieter and flatter and quiet music got louder and grittier.",
+        );
+        c |= toggle(
+            ui,
+            &mut p.loudness_guard,
+            "Level guard",
+            "Optional safety net, off by default: keeps Bass Mode from ever being louder than the original sound (plus any Bass boost you add) by turning it down smoothly when it gets too loud. Auto level already matches the volume, so you rarely need this.",
+        );
+        c
     });
 
     ui.add_space(6.0);
@@ -153,6 +188,43 @@ pub fn ui(ui: &mut egui::Ui, app: &mut App) {
             .changed()
         {
             app.cfg.jbl_intensity = pct.clamp(0, 100) as u8;
+            changed = true;
+        }
+        if ui
+            .add_enabled(
+                on,
+                egui::Slider::new(&mut app.cfg.jbl.bass_boost_db, 0.0..=12.0).suffix(" dB").text("Bass boost"),
+            )
+            .on_hover_text("Extra clean low-end gain on top of the effect, after the distortion. 0 = off.")
+            .changed()
+        {
+            changed = true;
+        }
+        // Preset picker: the selection is derived from the values every frame (never stored).
+        let presets = eq_core::jbl_presets();
+        let current = presets.iter().find(|p| p.matches(app.cfg.jbl_intensity, &app.cfg.jbl));
+        let mut picked = None;
+        ui.add_enabled_ui(on, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Preset");
+                egui::ComboBox::from_id_salt("jbl_preset")
+                    .selected_text(current.map_or("Custom", |p| p.name))
+                    .show_ui(ui, |ui| {
+                        for p in presets {
+                            let sel = current.is_some_and(|c| c.name == p.name);
+                            if ui.selectable_label(sel, p.name).on_hover_text(p.description).clicked() {
+                                picked = Some(p);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Load a ready-made JBL sound. Editing any value afterwards makes it Custom.");
+            });
+            ui.label(egui::RichText::new(current.map_or("Custom: hand-edited values.", |p| p.description)).weak());
+        });
+        if let Some(p) = picked {
+            app.cfg.jbl = p.params;
+            app.cfg.jbl_intensity = p.intensity;
             changed = true;
         }
         egui::CollapsingHeader::new("Advanced").default_open(false).show(ui, |ui| {

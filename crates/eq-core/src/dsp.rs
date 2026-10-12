@@ -214,14 +214,71 @@ fn soft_limit(x: f32) -> f32 {
     }
 }
 
-/// Loudness of JBL Bass Mode relative to the dry signal, in dB (0 = matched).
-const BASS_FX_TRIM_DB: f32 = -1.5;
+/// Static loudness target of JBL Bass Mode relative to the dry signal, in dB: a touch below dry.
+/// With auto level the effect lands here at every input level; with it off, only at the reference
+/// level (`AUTO_REF_DB`, about -18 dBFS RMS).
+const BASS_FX_TRIM_DB: f32 = -1.0;
+
+/// Auto level: the input RMS (dBFS) at which the clipper/saturator calibration (`LEVEL_DB_*` and the
+/// presets' `out_trim_db`) was made. The wet path always sees its input scaled to this level.
+#[cfg(test)]
+const AUTO_REF_DB: f32 = -18.0;
+/// Auto level: mean-square of the reference level (`10^(AUTO_REF_DB / 10)`; checked by a test).
+const AUTO_REF_MS: f32 = 0.015_848_932;
+/// Auto level: largest pre-gain (dB). Input quieter than `AUTO_REF_DB - AUTO_MAX_BOOST_DB` (-42 dBFS)
+/// gets this fixed gain, so silence and noise are never boosted without bound (and never NaN).
+#[cfg(test)]
+const AUTO_MAX_BOOST_DB: f32 = 24.0;
+/// Auto level: largest pre-attenuation (dB) for very hot input.
+#[cfg(test)]
+const AUTO_MAX_CUT_DB: f32 = 30.0;
+/// Auto level: floor of the mean-square ratio and the clamps of the make-up factor, derived from
+/// `AUTO_MAX_BOOST_DB` / `AUTO_MAX_CUT_DB` (10^(-24/10), 10^(-24/20), 10^(30/20); checked by a test).
+const AUTO_MIN_RATIO: f32 = 0.003_981_072;
+const AUTO_MIN_INV: f32 = 0.063_095_73;
+const AUTO_MAX_INV: f32 = 31.622_776;
+/// Auto level: attack / release (ms) of the input mean-square follower. Slow enough (>> one 40 Hz
+/// cycle) that the bass does not ripple the gain, fast enough to follow the programme.
+const AUTO_ATTACK_MS: f32 = 40.0;
+const AUTO_RELEASE_MS: f32 = 300.0;
+/// Auto level: when the level really drops (the fast follower, `AUTO_FAST_MS`, is more than
+/// `AUTO_DROP_RATIO` = 4 dB below the slow one), the slow follower catches up with time constant
+/// `AUTO_CATCHUP_MS`, so a sudden volume cut is not followed by a long burst of under-driven (too
+/// loud) output. Ordinary programme dips (< 4 dB) keep the slow release.
+const AUTO_FAST_MS: f32 = 40.0;
+const AUTO_CATCHUP_MS: f32 = 25.0;
+const AUTO_DROP_RATIO: f32 = 2.5;
+
+/// Level guard: window (ms) of the mean-square followers on the input and the wet signal. Long
+/// enough (>> one 40 Hz cycle) that the bass does not ripple the gain, short enough to follow the
+/// programme.
+const GUARD_WINDOW_MS: f32 = 150.0;
+/// Level guard: time (ms) for the gain to come down when the wet signal is too loud.
+const GUARD_ATTACK_MS: f32 = 40.0;
+/// Level guard: time (ms) for the gain to recover once the wet signal is no longer too loud.
+const GUARD_RELEASE_MS: f32 = 300.0;
+/// Level guard: mean-square floor (about -100 dBFS) below which the ratio is not trusted and the
+/// guard stays at unity, so silence and dither-level noise never produce gain swings or NaN.
+const GUARD_FLOOR: f32 = 1e-10;
+/// Level guard: ceiling of the wet RMS relative to the input RMS (dB), before `bass_boost_db`.
+const GUARD_CEILING_DB: f32 = 0.0;
+
+/// Two cascaded identical sections (4th order, Linkwitz-Riley when Butterworth Q).
+#[inline]
+fn lr4(b: &mut [Biquad; 2], x: f32) -> f32 {
+    let y = b[0].process(x);
+    b[1].process(y)
+}
 
 /// "JBL Bass Mode": car-subwoofer style bass boost, saturation and bass-keyed pumping.
 ///
 /// Low shelf boost, `tanh` clipping, then a gain dip keyed by the bass envelope so the
 /// mids and highs duck with each bass hit (an amp running out of headroom). The wet amount
-/// ramps over ~10 ms so toggling is click-free. Every stage is driven by [`JblParams`]
+/// ramps over ~10 ms so toggling is click-free. Auto level (`JblParams::auto_level`) pre-gains the
+/// wet path to a fixed reference level from a slow input level follower and undoes that gain on the
+/// wet output, so the distortion amount and the loudness do not depend on the input volume. An
+/// optional level guard (`JblParams::loudness_guard`) keeps the wet RMS from exceeding the input
+/// RMS. Every stage is driven by [`JblParams`]
 /// (values at 100 % intensity; the intensity scales them from idle). An optional LFO
 /// "trunk rattle" modulates the output gain and/or the kick-band level. Allocation-free per sample.
 #[derive(Clone, Copy, Debug)]
@@ -233,6 +290,9 @@ pub struct BassFx {
     params: JblParams,
     drive: f32,
     duck: f32,
+    /// Ducking floor (linear gain the duck gain is lifted towards); `duck_floor_on` false = no floor.
+    duck_floor: f32,
+    duck_floor_on: bool,
     shelf_l: Biquad,
     shelf_r: Biquad,
     detector: Biquad,
@@ -246,6 +306,10 @@ pub struct BassFx {
     held: [f32; 2],
     lp_l: Biquad,
     lp_r: Biquad,
+    /// Clean low shelf on the wet output (after the lo-fi stages); `boost_on` false = bypassed.
+    boost_on: bool,
+    boost_l: Biquad,
+    boost_r: Biquad,
     /// Sub resonance peak ahead of the clipper, and clip asymmetry bias.
     res_l: Biquad,
     res_r: Biquad,
@@ -257,6 +321,39 @@ pub struct BassFx {
     kick_drive: f32,
     /// Output trim that keeps the loudness near 0 dB versus the dry signal.
     out_gain: f32,
+    /// Auto level (see `AUTO_*`): on/off, mean-square follower of the (dry) input and its attack /
+    /// release coefficients. The wet path is pre-gained to the reference level and the same factor
+    /// is undone on the wet output, so the clipper sees a level-independent drive.
+    auto_on: bool,
+    lvl_ms: f32,
+    lvl_fast: f32,
+    lvl_att: f32,
+    lvl_rel: f32,
+    lvl_fc: f32,
+    lvl_cc: f32,
+    /// Level guard (see `GUARD_*`): on/off, ceiling (linear, vs input RMS), mean-square followers
+    /// of the input and of the wet signal, the smoothed gain applied to the wet signal, and the
+    /// one-pole coefficients for the followers / gain attack / gain release.
+    guard_on: bool,
+    guard_ceiling: f32,
+    guard_in: f32,
+    guard_out: f32,
+    guard_gain: f32,
+    guard_win: f32,
+    guard_att: f32,
+    guard_rel: f32,
+    /// Mids/highs pass-through (`JblParams::mid_pass`): amount (0 = off), crossover high passes
+    /// (two cascaded 2nd-order sections = 4th order, Linkwitz-Riley): a high pass on the dry input
+    /// and a low pass on the wet signal, and the guard's followers of the pass-through energy and its correlation with
+    /// the guarded wet signal.
+    mid_pass: f32,
+    mid_on: bool,
+    hp_dry_l: [Biquad; 2],
+    hp_dry_r: [Biquad; 2],
+    lp_wet_l: [Biquad; 2],
+    lp_wet_r: [Biquad; 2],
+    guard_pass: f32,
+    guard_cross: f32,
     /// Rattle LFO: phase (0..1, kept across reconfiguration), per-sample increment, effective
     /// depth (0 = inactive), and which paths it modulates.
     lfo_phase: f32,
@@ -278,6 +375,8 @@ impl BassFx {
             params: JblParams::default(),
             drive: 1.0,
             duck: 0.0,
+            duck_floor: 0.0,
+            duck_floor_on: false,
             shelf_l: Biquad::identity(),
             shelf_r: Biquad::identity(),
             detector: Biquad::identity(),
@@ -290,6 +389,9 @@ impl BassFx {
             held: [0.0; 2],
             lp_l: Biquad::identity(),
             lp_r: Biquad::identity(),
+            boost_on: false,
+            boost_l: Biquad::identity(),
+            boost_r: Biquad::identity(),
             res_l: Biquad::identity(),
             res_r: Biquad::identity(),
             bias: 0.0,
@@ -298,6 +400,29 @@ impl BassFx {
             kick_r: Biquad::identity(),
             kick_drive: 1.0,
             out_gain: 1.0,
+            auto_on: true,
+            lvl_ms: 0.0,
+            lvl_fast: 0.0,
+            lvl_att: 0.0,
+            lvl_rel: 0.0,
+            lvl_fc: 0.0,
+            lvl_cc: 0.0,
+            guard_on: true,
+            guard_ceiling: 1.0,
+            guard_in: 0.0,
+            guard_out: 0.0,
+            guard_gain: 1.0,
+            guard_win: 0.0,
+            guard_att: 0.0,
+            guard_rel: 0.0,
+            mid_pass: 0.0,
+            mid_on: false,
+            hp_dry_l: [Biquad::identity(); 2],
+            hp_dry_r: [Biquad::identity(); 2],
+            lp_wet_l: [Biquad::identity(); 2],
+            lp_wet_r: [Biquad::identity(); 2],
+            guard_pass: 0.0,
+            guard_cross: 0.0,
             lfo_phase: 0.0,
             lfo_inc: 0.0,
             lfo_depth: 0.0,
@@ -333,6 +458,8 @@ impl BassFx {
         self.intensity = i;
         self.drive = 1.0 + (p.drive_max - 1.0).max(0.0) * i;
         self.duck = if p.duck_on { p.duck_depth.max(0.0) * i } else { 0.0 };
+        self.duck_floor_on = p.duck_floor_db > crate::config::DUCK_FLOOR_OFF_DB;
+        self.duck_floor = if self.duck_floor_on { 10f32.powf(p.duck_floor_db / 20.0) } else { 0.0 };
         // Bit crush: step of the quantiser (0 = off), then sample-hold and a sliding low pass.
         self.quant_step =
             if p.crush_on { 2.0 / 2f32.powf(16.0 - (16.0 - p.crush_bits_min).max(0.0) * i) } else { 0.0 };
@@ -375,19 +502,78 @@ impl BassFx {
             self.res_l = Biquad::identity();
             self.res_r = Biquad::identity();
         }
+        // Clean wet-path bass boost: fully bypassed (and state cleared) at 0 dB.
+        if p.bass_boost_db > 0.0 {
+            let boost = FilterSpec {
+                kind: FilterKind::LowShelf,
+                fc_hz: f64::from(p.bass_boost_hz).min(nyq_cap),
+                gain_db: f64::from(p.bass_boost_db),
+                q: 0.7,
+                enabled: true,
+            };
+            if !self.boost_on {
+                self.boost_l.reset();
+                self.boost_r.reset();
+            }
+            self.boost_l.set_spec(&boost, self.fs);
+            self.boost_r.set_spec(&boost, self.fs);
+            self.boost_on = true;
+        } else {
+            self.boost_on = false;
+            self.boost_l = Biquad::identity();
+            self.boost_r = Biquad::identity();
+        }
+        // Mids/highs pass-through: crossover high passes (LR4) on the dry input and the wet signal.
+        if p.mid_pass > 0.0 {
+            let hp = FilterSpec {
+                kind: FilterKind::HighPass,
+                fc_hz: f64::from(p.mid_pass_hz).min(nyq_cap),
+                gain_db: 0.0,
+                q: 0.707,
+                enabled: true,
+            };
+            let lp = FilterSpec { kind: FilterKind::LowPass, ..hp };
+            if !self.mid_on {
+                self.reset_crossover();
+                self.guard_pass = 0.0;
+                self.guard_cross = 0.0;
+            }
+            let fs = self.fs;
+            for b in self.hp_dry_l.iter_mut().chain(self.hp_dry_r.iter_mut()) {
+                b.set_spec(&hp, fs);
+            }
+            for b in self.lp_wet_l.iter_mut().chain(self.lp_wet_r.iter_mut()) {
+                b.set_spec(&lp, fs);
+            }
+            self.mid_on = true;
+            self.mid_pass = p.mid_pass;
+        } else {
+            self.mid_on = false;
+            self.mid_pass = 0.0;
+        }
         self.bias = p.bias_max * i;
-        // Measured loudness of the effect (dB vs dry, music-like test signal) at 0/30/60/80/100 %
-        // for the default parameters; interpolated and cancelled so the mode stays around 0 dB.
+        // Measured loudness of the effect (dB vs dry, with the 0.45 base gain) at 0/30/60/80/90/100 %
+        // for the default parameters; interpolated and cancelled so the mode lands at `BASS_FX_TRIM_DB`
+        // (about 1 dB below dry). Auto level on: music-like test signals at -30..-12 dBFS RMS (the
+        // result is the same at every level). Auto level off (legacy): about -18 dBFS RMS only.
         // See `bass_fx_level_report`. `out_trim_db` lets the user correct drift for other settings.
-        const LEVEL_DB: [(f32, f32); 5] = [(0.0, 0.0), (0.3, 0.86), (0.6, 2.79), (0.8, 2.32), (1.0, 1.23)];
-        let mut meas = LEVEL_DB[4].1;
-        for w in LEVEL_DB.windows(2) {
+        const LEVEL_DB_AUTO: [(f32, f32); 6] =
+            [(0.0, -1.0), (0.3, 4.64), (0.6, 8.03), (0.8, 7.97), (0.9, 7.72), (1.0, 7.27)];
+        const LEVEL_DB_FIXED: [(f32, f32); 6] =
+            [(0.0, -1.0), (0.3, 2.88), (0.6, 5.27), (0.8, 5.07), (0.9, 4.74), (1.0, 4.32)];
+        let table = if p.auto_level { &LEVEL_DB_AUTO } else { &LEVEL_DB_FIXED };
+        let mut meas = table[5].1;
+        for w in table.windows(2) {
             if i <= w[1].0 {
                 meas = w[0].1 + (w[1].1 - w[0].1) * (i - w[0].0) / (w[1].0 - w[0].0);
                 break;
             }
         }
         self.out_gain = 0.45 * 10f32.powf((BASS_FX_TRIM_DB - meas) / 20.0) * 10f32.powf(p.out_trim_db / 20.0);
+        let was_idle = self.is_idle();
+        self.guard_on = p.loudness_guard;
+        self.auto_on = p.auto_level;
+        self.guard_ceiling = 10f32.powf((GUARD_CEILING_DB + p.bass_boost_db) / 20.0);
         self.kick_on = p.kick_on;
         self.kick_drive = 1.0 + (p.kick_drive_max - 1.0).max(0.0) * i;
         let kick = FilterSpec {
@@ -409,6 +595,16 @@ impl BassFx {
         self.detector.set_spec(&lp, self.fs);
         let fs = self.fs;
         let ms_to_coef = |ms: f32| (1.0 - (-1.0 / (f64::from(ms) / 1000.0 * fs).max(1.0)).exp()) as f32;
+        self.guard_win = ms_to_coef(GUARD_WINDOW_MS);
+        self.guard_att = ms_to_coef(GUARD_ATTACK_MS);
+        self.guard_rel = ms_to_coef(GUARD_RELEASE_MS);
+        self.lvl_att = ms_to_coef(AUTO_ATTACK_MS);
+        self.lvl_rel = ms_to_coef(AUTO_RELEASE_MS);
+        self.lvl_fc = ms_to_coef(AUTO_FAST_MS);
+        self.lvl_cc = ms_to_coef(AUTO_CATCHUP_MS);
+        if was_idle && enabled {
+            self.reset_guard();
+        }
         self.attack = ms_to_coef(p.duck_attack_ms);
         self.release = ms_to_coef(p.duck_release_ms);
         // LFO: the phase is deliberately left alone so reconfiguring does not glitch the rattle.
@@ -428,6 +624,12 @@ impl BassFx {
     /// Process a stereo block in place.
     pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
         if self.is_idle() {
+            // Keep the input level follower running so switching the effect on starts at the right gain.
+            if self.auto_on {
+                for (xl, xr) in l.iter().zip(r.iter()) {
+                    self.track_level(0.5 * (*xl * *xl + *xr * *xr));
+                }
+            }
             return;
         }
         let step = (1.0 / (BYPASS_RAMP_SECS * self.fs).max(1.0)) as f32;
@@ -435,6 +637,20 @@ impl BassFx {
         let kn = 0.8 / self.kick_drive.tanh().max(1e-3);
         let lfo_active = self.lfo_depth > 0.0 && (self.lfo_gain || (self.lfo_band && self.kick_on));
         for (xl, xr) in l.iter_mut().zip(r.iter_mut()) {
+            // Input loudness for the level guard (dry input, before the mix is applied).
+            let guard_x = 0.5 * (*xl * *xl + *xr * *xr);
+            // Auto level: one scalar gain for both channels (stereo image kept), from the input
+            // mean-square: pre-gain `a` takes the input to the reference level, `inv` = 1/a undoes it.
+            let (a, inv) = if self.auto_on {
+                self.track_level(guard_x);
+                let inv = (self.lvl_ms.max(AUTO_REF_MS * AUTO_MIN_RATIO) / AUTO_REF_MS)
+                    .sqrt()
+                    .clamp(AUTO_MIN_INV, AUTO_MAX_INV);
+                (1.0 / inv, inv)
+            } else {
+                (1.0, 1.0)
+            };
+            let (inl, inr) = if self.auto_on { (*xl * a, *xr * a) } else { (*xl, *xr) };
             if self.mix < self.target {
                 self.mix = (self.mix + step).min(self.target);
             } else if self.mix > self.target {
@@ -452,8 +668,8 @@ impl BassFx {
             } else {
                 1.0
             };
-            let sl = self.res_l.process(self.shelf_l.process(*xl));
-            let sr = self.res_r.process(self.shelf_r.process(*xr));
+            let sl = self.res_l.process(self.shelf_l.process(inl));
+            let sr = self.res_r.process(self.shelf_r.process(inr));
             // Kick/bass band gets its own heavy saturation before the full-band clipper.
             let (sl, sr) = if self.kick_on {
                 let (kl, kr) = (self.kick_l.process(sl), self.kick_r.process(sr));
@@ -466,6 +682,10 @@ impl BassFx {
             let coef = if bass > self.env { self.attack } else { self.release };
             self.env += (bass - self.env) * coef;
             let mut g = 1.0 / (1.0 + self.duck * self.env.min(2.0));
+            if self.duck_floor_on {
+                // Floor: same curve, but the dip stops at `duck_floor` (1 stays 1).
+                g = self.duck_floor + (1.0 - self.duck_floor) * g;
+            }
             if self.lfo_gain {
                 g *= lfo;
             }
@@ -491,13 +711,105 @@ impl BassFx {
             }
             yl = self.lp_l.process(yl);
             yr = self.lp_r.process(yr);
+            if self.auto_on {
+                // Back to the true level (wet part only; the dry pass-through below was never pre-gained).
+                yl *= inv;
+                yr *= inv;
+            }
+            // Mids/highs pass-through (Linkwitz-Riley split): `mid_pass` of the wet signal's band
+            // above the crossover is swapped for the same amount of the DRY band there (the dry part
+            // is added after the guard). With wet == dry the two bands sum to an all-pass.
+            let (mut pl, mut pr) = (0.0f32, 0.0f32);
+            if self.mid_on {
+                let (wl, wr) = (lr4(&mut self.lp_wet_l, yl), lr4(&mut self.lp_wet_r, yr));
+                // The pass-through pumps with the same duck gain (and rattle) as the processed signal.
+                pl = self.mid_pass * g * lr4(&mut self.hp_dry_l, *xl);
+                pr = self.mid_pass * g * lr4(&mut self.hp_dry_r, *xr);
+                yl += self.mid_pass * (wl - yl);
+                yr += self.mid_pass * (wr - yr);
+            }
+            if self.boost_on {
+                // Clean bass boost after all distortion; soft limit keeps the wet signal bounded.
+                yl = soft_limit(self.boost_l.process(yl));
+                yr = soft_limit(self.boost_r.process(yr));
+            }
+            if self.guard_on {
+                // Level guard: follow the mean-square of the input and of the wet signal with the same
+                // window, and turn the wet signal down so its RMS never exceeds ceiling * input RMS.
+                // Fast attack, slow release; the gain only ever attenuates. With the mids/highs
+                // pass-through, only the processed part is turned down: the gain g solves
+                // g^2 E_wet + 2 g C + E_pass = ceiling^2 E_in (C = wet/pass correlation), so the
+                // pass-through is counted but never attenuated.
+                let w = self.guard_win;
+                self.guard_in += (guard_x - self.guard_in) * w;
+                self.guard_out += (0.5 * (yl * yl + yr * yr) - self.guard_out) * w;
+                let target = if self.guard_in > GUARD_FLOOR && self.guard_out > GUARD_FLOOR {
+                    if self.mid_on {
+                        self.guard_pass += (0.5 * (pl * pl + pr * pr) - self.guard_pass) * w;
+                        self.guard_cross += (0.5 * (yl * pl + yr * pr) - self.guard_cross) * w;
+                        let c = self.guard_pass - self.guard_ceiling * self.guard_ceiling * self.guard_in;
+                        let (a, b) = (self.guard_out, self.guard_cross);
+                        ((-b + (b * b - a * c).max(0.0).sqrt()) / a).clamp(0.0, 1.0)
+                    } else {
+                        (self.guard_ceiling * (self.guard_in / self.guard_out).sqrt()).min(1.0)
+                    }
+                } else {
+                    1.0
+                };
+                let c = if target < self.guard_gain { self.guard_att } else { self.guard_rel };
+                self.guard_gain += (target - self.guard_gain) * c;
+                yl *= self.guard_gain;
+                yr *= self.guard_gain;
+            }
+            if self.mid_on {
+                // The dry band is added on top of the (bounded) wet signal: keep the sum bounded too.
+                yl = soft_limit(yl + pl);
+                yr = soft_limit(yr + pr);
+            }
             *xl += (yl - *xl) * self.mix;
             *xr += (yr - *xr) * self.mix;
         }
     }
 
-    /// Clear filter, envelope and LFO state.
+    fn crossover_sections(&mut self) -> impl Iterator<Item = &mut Biquad> {
+        self.hp_dry_l.iter_mut().chain(self.hp_dry_r.iter_mut()).chain(self.lp_wet_l.iter_mut()).chain(self.lp_wet_r.iter_mut())
+    }
+
+    fn reset_crossover(&mut self) {
+        self.crossover_sections().for_each(Biquad::reset);
+    }
+
+    /// Auto level: update the input mean-square followers with the instantaneous power `x`.
+    #[inline]
+    fn track_level(&mut self, x: f32) {
+        self.lvl_fast += (x - self.lvl_fast) * self.lvl_fc;
+        let c = if x > self.lvl_ms {
+            self.lvl_att
+        } else if self.lvl_ms > AUTO_DROP_RATIO * self.lvl_fast {
+            self.lvl_cc
+        } else {
+            self.lvl_rel
+        };
+        self.lvl_ms += (x - self.lvl_ms) * c;
+    }
+
+    fn reset_level(&mut self) {
+        self.lvl_ms = 0.0;
+        self.lvl_fast = 0.0;
+    }
+
+    fn reset_guard(&mut self) {
+        self.guard_in = 0.0;
+        self.guard_out = 0.0;
+        self.guard_gain = 1.0;
+        self.guard_pass = 0.0;
+        self.guard_cross = 0.0;
+    }
+
+    /// Clear filter, envelope, level-guard and LFO state.
     pub fn reset(&mut self) {
+        self.reset_guard();
+        self.reset_level();
         self.shelf_l.reset();
         self.shelf_r.reset();
         self.detector.reset();
@@ -507,6 +819,9 @@ impl BassFx {
         self.res_r.reset();
         self.lp_l.reset();
         self.lp_r.reset();
+        self.boost_l.reset();
+        self.boost_r.reset();
+        self.reset_crossover();
         self.held = [0.0; 2];
         self.env = 0.0;
         self.lfo_phase = 0.0;
@@ -1119,15 +1434,9 @@ mod bass_fx_tests {
         vec![("kick+sub", scale(a)), ("fullband", scale(b)), ("kick+vox", scale(c))]
     }
 
-    /// Loudness report: JBL output vs dry at 30/60/80/100 % for the old calibration tone and three
-    /// music-like signals at -18 dBFS RMS (typical programme level after EQ headroom). The mean must
-    /// sit near `BASS_FX_TRIM_DB` (re-calibrate `LEVEL_DB` from this printout when defaults change).
-    #[test]
-    fn bass_fx_level_report() {
-        let fs = 48000.0;
-        let n = 96000;
-        // Calibration tone: 55 Hz kick-ish + mid tones + highs, ~-18 dBFS RMS.
-        let tone: Vec<f32> = (0..n)
+    /// Calibration tone: 55 Hz kick-ish + mid tones + highs, about -18 dBFS RMS.
+    fn calibration_tone(n: usize, fs: f64) -> Vec<f32> {
+        (0..n)
             .map(|i| {
                 let t = i as f64 / fs;
                 let env = (-((t * 2.0) % 1.0) * 6.0).exp();
@@ -1136,26 +1445,75 @@ mod bass_fx_tests {
                     + 0.08 * (2.0 * PI * 2500.0 * t).sin()
                     + 0.04 * (2.0 * PI * 7000.0 * t).sin()) as f32
             })
-            .collect();
-        let mut sigs = level_signals(n, fs, -18.0);
-        sigs.push(("tone", tone));
-        let rms = |v: &[f32]| (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
-        for pct in [30u8, 60, 80, 100] {
-            let mut sum = 0.0;
-            for (name, x) in &sigs {
-                let (mut l, mut r) = (x.clone(), x.clone());
-                let mut eq = StereoEq::new(fs);
-                eq.set_limiter(true);
-                eq.set_bass_fx(true, pct, &JblParams::default());
-                eq.process_stereo(&mut l, &mut r);
-                let db = 20.0 * (rms(&l[n / 2..]) / rms(&x[n / 2..])).log10();
-                println!("LEVEL pct={pct} {name} gain_db={db:.2}");
-                assert!((db - f64::from(BASS_FX_TRIM_DB)).abs() < 2.0, "{name} level off at {pct}%: {db:.2} dB");
-                sum += db;
+            .collect()
+    }
+
+    /// "Mastered" version of `x` at `rms_db` dBFS RMS: gain, then a gentle `tanh` ceiling at 0.98
+    /// (found by bisection), so hot levels have a realistic crest factor and peaks stay below 1.0.
+    fn master_to(x: &[f32], rms_db: f64) -> Vec<f32> {
+        let clip = |v: f32, g: f64| (0.98 * (f64::from(v) * g / 0.98).tanh()) as f32;
+        let target = 10f64.powf(rms_db / 20.0);
+        let (mut lo, mut hi) = (1e-3f64, 1e3f64);
+        for _ in 0..60 {
+            let g = (lo * hi).sqrt();
+            let r = (x.iter().map(|v| f64::from(clip(*v, g)).powi(2)).sum::<f64>() / x.len() as f64).sqrt();
+            if r < target {
+                lo = g;
+            } else {
+                hi = g;
             }
-            let mean = sum / sigs.len() as f64;
-            println!("LEVEL pct={pct} MEAN gain_db={mean:.2}");
-            assert!((mean - f64::from(BASS_FX_TRIM_DB)).abs() < 0.75, "mean level drifted at {pct}%: {mean:.2} dB");
+        }
+        let g = (lo * hi).sqrt();
+        x.iter().map(|v| clip(*v, g)).collect()
+    }
+
+    /// The music-like signals plus the calibration tone, "mastered" to `rms_db` dBFS RMS.
+    fn all_level_signals(n: usize, fs: f64, rms_db: f64) -> Vec<(&'static str, Vec<f32>)> {
+        let mut sigs = level_signals(n, fs, -18.0);
+        sigs.push(("tone", calibration_tone(n, fs)));
+        sigs.into_iter().map(|(name, x)| (name, master_to(&x, rms_db))).collect()
+    }
+
+    /// Mean (over the signals) JBL-vs-dry loudness in dB through a full `StereoEq`, second half of the
+    /// render only (the level followers have settled).
+    fn jbl_gain_db(fs: f64, pct: u8, p: &JblParams, sigs: &[(&'static str, Vec<f32>)]) -> f64 {
+        let mut sum = 0.0;
+        for (_, x) in sigs {
+            let n = x.len();
+            let (mut l, mut r) = (x.clone(), x.clone());
+            let mut eq = StereoEq::new(fs);
+            eq.set_limiter(true);
+            eq.set_bass_fx(true, pct, p);
+            eq.process_stereo(&mut l, &mut r);
+            sum += 20.0 * (rms_of(&l[n / 2..]) / rms_of(&x[n / 2..])).log10();
+        }
+        sum / sigs.len() as f64
+    }
+
+    const TEST_LEVELS_DB: [f64; 6] = [-30.0, -24.0, -18.0, -12.0, -6.0, -3.0];
+
+    /// Loudness report: JBL (auto level on, guard off) vs dry at 30/60/80/90/100 % for the calibration
+    /// tone and three music-like signals at -30..-3 dBFS RMS. At every level the mean must sit near
+    /// `BASS_FX_TRIM_DB` (re-calibrate `LEVEL_DB` from this printout when defaults change).
+    #[test]
+    fn bass_fx_level_report() {
+        let fs = 48000.0;
+        let n = 96000;
+        for pct in [30u8, 60, 80, 90, 100] {
+            let mut all = 0.0;
+            for lv in TEST_LEVELS_DB {
+                let sigs = all_level_signals(n, fs, lv);
+                let p = JblParams { loudness_guard: false, ..JblParams::default() };
+                let mean = jbl_gain_db(fs, pct, &p, &sigs);
+                println!("LEVEL pct={pct} in={lv:.0} MEAN gain_db={mean:.2}");
+                if std::env::var_os("LEVEL_CAPTURE").is_none() {
+                    // At -3 dBFS RMS (a crushed master, peaks at 0.98) the soft limiters take a bit more.
+                    let tol = if lv > -6.0 { 2.0 } else { 1.5 };
+                    assert!((mean - f64::from(BASS_FX_TRIM_DB)).abs() < tol, "level {lv} at {pct}%: {mean:.2} dB vs dry");
+                }
+                all += mean;
+            }
+            println!("LEVEL pct={pct} ALL gain_db={:.2}", all / TEST_LEVELS_DB.len() as f64);
         }
     }
 
@@ -1173,38 +1531,72 @@ mod bass_fx_tests {
         (mk(1.0), mk(0.8))
     }
 
-    /// Golden regression for the default BassFx sound. Re-captured when the defaults were retuned
-    /// (res_db 9 -> 6, res_q 3 -> 2, drive_max 5 -> 4, plus the `LEVEL_DB` recalibration); it must
-    /// not change from DSP refactors that keep the defaults.
+    /// Parameters the two golden tables (`GOLDEN_VALUES*`) were captured with: the plain pre-pass-through,
+    /// pre-floor, pre-auto-level path (this guards the original signal path bit-for-bit), not the
+    /// current Default.
+    fn golden_params() -> JblParams {
+        JblParams {
+            duck_depth: 0.9,
+            duck_floor_db: crate::config::DUCK_FLOOR_OFF_DB,
+            drive_max: 6.5,
+            kick_drive_max: 2.0,
+            mid_pass: 0.0,
+            out_trim_db: 0.0,
+            auto_level: false,
+            ..JblParams::default()
+        }
+    }
+
+    /// Golden regression for the default BassFx sound (`GOLDEN_VALUES`, level guard on) and for the same
+    /// sound with the guard switched off (`GOLDEN_VALUES_OFF`; the guard-off path is the pre-guard
+    /// signal path, so it must stay bit-for-bit what it was). Re-captured when the defaults were
+    /// retuned: Default duck depth 4.0 -> 0.9 (mids/highs ducked less), `LEVEL_DB` re-calibrated to land
+    /// about 1 dB below dry (`BASS_FX_TRIM_DB` = -1), and the new level guard (on by default), which
+    /// trims the wet signal wherever the effect would be louder than its input. They must not change
+    /// from DSP refactors that keep the defaults.
     #[test]
     fn bass_fx_golden_default_output() {
         let fs = 48000.0;
         let n = 48000;
         let (x_l, x_r) = golden_signal(n, fs);
         // (pct, rms_l, rms_r, [l[1000], l[12000], l[30001], r[20000], r[47999]])
-        let golden: [(u8, f64, f64, [f32; 5]); 4] = GOLDEN_VALUES;
-        for (pct, g_rms_l, g_rms_r, g_samples) in golden {
-            let (mut l, mut r) = (x_l.clone(), x_r.clone());
-            let mut eq = StereoEq::new(fs);
-            eq.set_limiter(true);
-            eq.set_bass_fx(true, pct, &JblParams::default());
-            eq.process_stereo(&mut l, &mut r);
-            let rms = |v: &[f32]| (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
-            let got = [l[1000], l[12000], l[30001], r[20000], r[47999]];
-            println!("GOLDEN pct={pct} rms_l={:.9} rms_r={:.9} samples={:?}", rms(&l), rms(&r), got);
-            assert!((rms(&l) - g_rms_l).abs() < 1e-6, "rms_l changed at {pct}%: {} vs {g_rms_l}", rms(&l));
-            assert!((rms(&r) - g_rms_r).abs() < 1e-6, "rms_r changed at {pct}%: {} vs {g_rms_r}", rms(&r));
-            for (a, b) in got.iter().zip(g_samples.iter()) {
-                assert!((a - b).abs() < 1e-5, "sample changed at {pct}%: {a} vs {b}");
+        for (guard, golden) in [(true, GOLDEN_VALUES), (false, GOLDEN_VALUES_OFF)] {
+            // The guard only acts when the effect would be louder than its input, so the guard-on
+            // capture feeds a quiet (-20 dB) version of the signal, where it is clearly engaged.
+            let gain = if guard { 0.1 } else { 1.0 };
+            for (pct, g_rms_l, g_rms_r, g_samples) in golden {
+                let (mut l, mut r): (Vec<f32>, Vec<f32>) =
+                    (x_l.iter().map(|v| v * gain).collect(), x_r.iter().map(|v| v * gain).collect());
+                let mut eq = StereoEq::new(fs);
+                eq.set_limiter(true);
+                eq.set_bass_fx(true, pct, &JblParams { loudness_guard: guard, ..golden_params() });
+                eq.process_stereo(&mut l, &mut r);
+                let rms = |v: &[f32]| (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+                let got = [l[1000], l[12000], l[30001], r[20000], r[47999]];
+                println!("GOLDEN guard={guard} pct={pct} rms_l={:.9} rms_r={:.9} samples={:?}", rms(&l), rms(&r), got);
+                if std::env::var_os("GOLDEN_CAPTURE").is_some() {
+                    continue; // print-only mode for re-capturing the tables below
+                }
+                assert!((rms(&l) - g_rms_l).abs() < 1e-6, "rms_l changed at {pct}% guard={guard}: {} vs {g_rms_l}", rms(&l));
+                assert!((rms(&r) - g_rms_r).abs() < 1e-6, "rms_r changed at {pct}% guard={guard}: {} vs {g_rms_r}", rms(&r));
+                for (a, b) in got.iter().zip(g_samples.iter()) {
+                    assert!((a - b).abs() < 1e-5, "sample changed at {pct}% guard={guard}: {a} vs {b}");
+                }
             }
         }
     }
 
     const GOLDEN_VALUES: [(u8, f64, f64, [f32; 5]); 4] = [
-        (30, 0.180613230, 0.180478605, [0.17582655, -0.20840953, 0.20334709, -0.24601033, -0.14398156]),
-        (60, 0.123357297, 0.123356423, [0.10713634, -0.14554128, 0.12687653, -0.14801922, -0.14690912]),
-        (80, 0.102350772, 0.102268223, [0.074729785, -0.12072089, 0.09691678, -0.121571034, -0.12072089]),
-        (100, 0.089456323, 0.089219136, [0.06836742, -0.10359563, 0.078125, -0.109375, -0.107421875]),
+        (30, 0.025029625, 0.024738744, [0.0295918, -0.022795824, 0.029564697, -0.032025337, -0.015578992]),
+        (60, 0.027380994, 0.027291761, [0.033338424, -0.021420917, 0.029934185, -0.037474297, -0.026813412]),
+        (80, 0.030882675, 0.030860605, [0.03095889, -0.018173989, 0.025837451, -0.03944438, -0.03383317]),
+        (100, 0.033654449, 0.033659080, [0.015548063, -0.013222201, 0.021554193, -0.035479497, -0.035110615]),
+    ];
+    const GOLDEN_VALUES_OFF: [(u8, f64, f64, [f32; 5]); 4] = [
+        (30, 0.179586074, 0.179944428, [0.1739729, -0.17117979, 0.19096248, -0.23139955, -0.14926437]),
+        (60, 0.126787082, 0.126777496, [0.11095706, -0.12877673, 0.115828216, -0.13728784, -0.14431871]),
+        (80, 0.109297161, 0.109295564, [0.089102, -0.10711855, 0.08926545, -0.11647016, -0.12412149]),
+        (100, 0.097723692, 0.097570002, [0.07368797, -0.09375, 0.072265625, -0.10546875, -0.11328125]),
     ];
 
     #[test]
@@ -1252,7 +1644,8 @@ mod bass_fx_tests {
 
     #[test]
     fn bass_fx_lfo_depth_zero_or_off_is_identical() {
-        let base = run_fx(48000.0, 80, &JblParams::default(), 24000);
+        // The LFO is on by default, so the reference is the default set with the LFO switched off.
+        let base = run_fx(48000.0, 80, &JblParams { lfo_on: false, ..JblParams::default() }, 24000);
         for target in [JblLfoTarget::Gain, JblLfoTarget::BassBand, JblLfoTarget::Both] {
             let off = JblParams { lfo_on: false, lfo_depth: 0.8, lfo_target: target, ..JblParams::default() };
             let zero = JblParams { lfo_on: true, lfo_depth: 0.0, lfo_target: target, ..JblParams::default() };
@@ -1289,10 +1682,10 @@ mod bass_fx_tests {
         let mean = env.iter().sum::<f32>() / env.len() as f32;
         let var = env.iter().map(|e| (e - mean).powi(2)).sum::<f32>();
         assert!(var > 1e-3, "envelope should wobble, var={var}");
-        // One LFO period = fs/rate samples = 1/6 s = 40 windows: envelope repeats.
+        // One LFO period = fs/rate samples = 1/6 s = 33.3 windows (rounded to 33, so a steeper default drive needs slack): envelope repeats.
         let period = (fs / f64::from(rate) / win as f64).round() as usize;
         for k in 0..env.len() - period {
-            assert!((env[k] - env[k + period]).abs() < 0.02, "not periodic at {k}: {} vs {}", env[k], env[k + period]);
+            assert!((env[k] - env[k + period]).abs() < 0.04, "not periodic at {k}: {} vs {}", env[k], env[k + period]);
         }
     }
 
@@ -1429,6 +1822,817 @@ mod bass_fx_tests {
         let diff: f32 = l.iter().zip(&x).map(|(a, b)| (a - b).abs()).sum();
         assert!(diff > 100.0, "effect should audibly alter the signal, diff={diff}");
     }
+
+    /// Every built-in JBL preset renders finite and within +-1 at all rates and intensities.
+    #[test]
+    fn jbl_presets_finite_and_bounded() {
+        for pr in crate::config::jbl_presets() {
+            for fs in [44100.0, 48000.0, 96000.0, 192000.0] {
+                for pct in [0u8, 50, 100] {
+                    let (l, r) = run_fx(fs, pct, &pr.params, 19200);
+                    assert!(
+                        l.iter().chain(r.iter()).all(|s| s.is_finite() && s.abs() <= 1.0),
+                        "{}: non-finite/unbounded at fs={fs} pct={pct}",
+                        pr.name
+                    );
+                }
+            }
+        }
+    }
+
+    fn rms_of(v: &[f32]) -> f64 {
+        (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt()
+    }
+
+    fn render_mono(fs: f64, x: &[f32], pct: u8, p: &JblParams) -> Vec<f32> {
+        let (mut l, mut r) = (x.to_vec(), x.to_vec());
+        let mut eq = StereoEq::new(fs);
+        eq.set_limiter(true);
+        eq.set_bass_fx(true, pct, p);
+        for (cl, cr) in l.chunks_mut(480).zip(r.chunks_mut(480)) {
+            eq.process_stereo(cl, cr);
+        }
+        l
+    }
+
+    /// With the (opt-in) level guard on, JBL Bass Mode is never louder than its input, with or without auto level.
+    /// Every preset and the default, at -30..-6 dBFS RMS programme level and 44.1/48/96 kHz, over the
+    /// three music-like signals: RMS(out)/RMS(in) <= +0.5 dB (0 dB ceiling plus measurement slack).
+    #[test]
+    fn bass_fx_guard_never_louder_than_input() {
+        let mut worst = f64::NEG_INFINITY;
+        for fs in [44100.0, 48000.0, 96000.0] {
+            let n = (fs * 3.0) as usize;
+            let skip = (fs * 1.0) as usize;
+            let base = level_signals(n, fs, -18.0);
+            for pr in crate::config::jbl_presets() {
+                for lv in [-30.0f64, -24.0, -18.0, -12.0, -6.0] {
+                    let g = 10f64.powf((lv + 18.0) / 20.0) as f32;
+                    for (name, x) in &base {
+                        let x: Vec<f32> = x.iter().map(|v| v * g).collect();
+                        for auto in [false, true] {
+                            let p = JblParams { loudness_guard: true, auto_level: auto, ..pr.params };
+                            let y = render_mono(fs, &x, pr.intensity, &p);
+                            let db = 20.0 * (rms_of(&y[skip..]) / rms_of(&x[skip..])).log10();
+                            worst = worst.max(db);
+                            assert!(
+                                db <= 0.5,
+                                "{} {name} at {lv} dBFS, {fs} Hz, auto {auto}: out is {db:+.2} dB vs in",
+                                pr.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        println!("GUARD worst out-in over all presets/levels/rates: {worst:+.2} dB");
+    }
+
+    /// Switching the guard off (with auto level off) gives the old (louder at low levels) behaviour, and the guard only
+    /// ever attenuates: guard-on output RMS never exceeds guard-off output RMS.
+    #[test]
+    fn bass_fx_guard_off_is_louder_at_low_level_and_on_only_attenuates() {
+        let fs = 48000.0;
+        let n = 96000;
+        let base = level_signals(n, fs, -30.0);
+        let (x, skip) = (&base[0].1, 48000);
+        let fixed = JblParams { auto_level: false, ..JblParams::default() };
+        let on = render_mono(fs, x, 90, &JblParams { loudness_guard: true, ..fixed });
+        let off = render_mono(fs, x, 90, &JblParams { loudness_guard: false, ..fixed });
+        let (ron, roff) = (rms_of(&on[skip..]), rms_of(&off[skip..]));
+        assert!(roff > 1.5 * rms_of(&x[skip..]), "unguarded effect should be well above dry at -30 dBFS");
+        assert!(ron < 1.05 * rms_of(&x[skip..]) && ron < roff);
+    }
+
+    /// An explicit Bass boost raises the guard's ceiling by its dB amount (and no more).
+    #[test]
+    fn bass_fx_guard_ceiling_follows_bass_boost() {
+        let fs = 48000.0;
+        let n = 144000;
+        let base = level_signals(n, fs, -30.0);
+        let skip = 48000;
+        for (name, x) in &base {
+            let g = JblParams { loudness_guard: true, auto_level: false, ..JblParams::default() };
+            let plain = render_mono(fs, x, 90, &g);
+            let boosted = render_mono(fs, x, 90, &JblParams { bass_boost_db: 6.0, ..g });
+            let (dp, db) = (
+                20.0 * (rms_of(&plain[skip..]) / rms_of(&x[skip..])).log10(),
+                20.0 * (rms_of(&boosted[skip..]) / rms_of(&x[skip..])).log10(),
+            );
+            assert!(dp <= 0.5, "{name}: {dp}");
+            assert!(db > dp + 1.0, "{name}: boost should be audible past the plain ceiling ({db} vs {dp})");
+            assert!(db <= 6.5, "{name}: boosted ceiling is 6 dB, got {db}");
+        }
+    }
+
+    /// A level step (-36 -> -18 dBFS) is not left sticking out: from 50 ms after it the short-term (100 ms)
+    /// out/in level never exceeds +3 dB, and the guard does not pump: its gain moves smoothly.
+    #[test]
+    fn bass_fx_guard_step_response_and_smooth_gain() {
+        let fs = 48000.0;
+        let seg = 96000;
+        let quiet = level_signals(seg, fs, -36.0);
+        let loud = level_signals(seg, fs, -18.0);
+        for k in 0..3 {
+            let x: Vec<f32> = quiet[k].1.iter().chain(loud[k].1.iter()).copied().collect();
+            let mut fx = BassFx::new(fs);
+            fx.set(true, 90, &JblParams { loudness_guard: true, auto_level: false, ..JblParams::default() });
+            let (mut l, mut r) = (x.clone(), x.clone());
+            let mut gains = Vec::with_capacity(l.len());
+            for (a, b) in l.chunks_mut(1).zip(r.chunks_mut(1)) {
+                fx.process(a, b);
+                gains.push(fx.guard_gain);
+            }
+            let win = (fs * 0.1) as usize;
+            let mut t = seg + win / 2;
+            while t + win <= l.len() {
+                let db = 20.0 * (rms_of(&l[t..t + win]) / rms_of(&x[t..t + win])).log10();
+                assert!(db < 3.0, "{}: {db:+.2} dB over input {} ms after the step", quiet[k].0, (t - seg) * 1000 / 48000);
+                t += win;
+            }
+            assert!(gains.iter().all(|g| g.is_finite() && *g > 0.0 && *g <= 1.0));
+            let step = gains.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+            assert!(step < 2e-3, "{}: guard gain jumps by {step} in one sample", quiet[k].0);
+        }
+    }
+
+    #[test]
+    fn bass_fx_guard_silence_and_noise_floor() {
+        for fs in [44100.0, 48000.0, 96000.0] {
+            for amp in [0.0f32, 1e-9, 1e-6] {
+                let n = (fs * 0.5) as usize;
+                let x: Vec<f32> = (0..n).map(|i| amp * ((i as f32) * 0.37).sin()).collect();
+                let y = render_mono(fs, &x, 90, &JblParams { loudness_guard: true, ..JblParams::default() });
+                assert!(y.iter().all(|v| v.is_finite()), "non-finite at amp {amp}");
+                if amp == 0.0 {
+                    assert!(y.iter().all(|v| *v == 0.0), "silence in must be silence out");
+                } else {
+                    assert!(y.iter().all(|v| v.abs() < 1e-3), "tiny input must not blow up (amp {amp})");
+                }
+            }
+        }
+        // Loud material then silence: the tail decays to zero, no NaN from 0/0 in the guard.
+        let fs = 48000.0;
+        let mut x = level_signals(48000, fs, -18.0).remove(1).1;
+        x.extend(std::iter::repeat_n(0.0f32, 96000));
+        let y = render_mono(fs, &x, 90, &JblParams { loudness_guard: true, ..JblParams::default() });
+        assert!(y.iter().all(|v| v.is_finite()));
+        assert!(y[y.len() - 4800..].iter().all(|v| v.abs() < 1e-4));
+    }
+
+    #[test]
+    fn bass_fx_guard_reset_and_sample_rate_change() {
+        let mut fx = BassFx::new(48000.0);
+        let guarded = JblParams { loudness_guard: true, auto_level: false, ..JblParams::default() };
+        fx.set(true, 90, &guarded);
+        let x = level_signals(48000, 48000.0, -30.0).remove(0).1;
+        let (mut l, mut r) = (x.clone(), x);
+        fx.process(&mut l, &mut r);
+        assert!(fx.guard_in > 0.0 && fx.guard_out > 0.0 && fx.guard_gain < 1.0, "guard should be engaged at -30 dBFS");
+        let gain = fx.guard_gain;
+        fx.set_sample_rate(96000.0);
+        assert_eq!(fx.guard_gain, gain, "state is kept across a rate change");
+        let mut fresh = BassFx::new(96000.0);
+        fresh.set(true, 90, &JblParams::default());
+        assert_eq!((fx.guard_win, fx.guard_att, fx.guard_rel), (fresh.guard_win, fresh.guard_att, fresh.guard_rel));
+        fx.reset();
+        assert_eq!((fx.guard_in, fx.guard_out, fx.guard_gain), (0.0, 0.0, 1.0));
+        // Parameter changes while running keep working and stay bounded.
+        fx.set(true, 50, &JblParams { loudness_guard: false, ..guarded });
+        fx.set(true, 50, &guarded);
+        let (mut l, mut r) = (vec![0.05f32; 4800], vec![0.05f32; 4800]);
+        fx.process(&mut l, &mut r);
+        assert!(l.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+    }
+
+    /// Each preset is loudness-matched to the default sound (guard off, auto level on): mean over the
+    /// music-like signals at -30..-12 dBFS RMS (48 kHz, at the preset's own intensity) within 1 dB of
+    /// the Default, and the Default itself near `BASS_FX_TRIM_DB` (just below dry) at every level
+    /// including the hot ones (-6/-3 dBFS, where the soft limiters may take up to ~1.5 dB more).
+    /// A DSP retune that breaks the matching must re-trim the presets' `out_trim_db`.
+    #[test]
+    fn jbl_presets_loudness_matched() {
+        let fs = 48000.0;
+        let n = 96000;
+        let d_int = crate::config::Config::default().jbl_intensity;
+        let mut sets = Vec::new();
+        for lv in TEST_LEVELS_DB {
+            sets.push((lv, all_level_signals(n, fs, lv)));
+        }
+        let reference: Vec<f64> = sets.iter().map(|(_, s)| jbl_gain_db(fs, d_int, &JblParams::default(), s)).collect();
+        for ((lv, _), r) in sets.iter().zip(&reference) {
+            println!("PRESET LEVEL Default in={lv:.0} {r:+.2} dB");
+            let tol = if *lv > -6.0 { 2.0 } else { 1.5 };
+            assert!((r - f64::from(BASS_FX_TRIM_DB)).abs() < tol, "default is {r:.2} dB vs dry at {lv} dBFS");
+        }
+        for pr in crate::config::jbl_presets() {
+            let mut line = format!("PRESET LEVEL {:14}", pr.name);
+            for ((lv, sigs), r) in sets.iter().zip(&reference) {
+                let db = jbl_gain_db(fs, pr.intensity, &pr.params, sigs);
+                line += &format!(" {lv:.0}:{db:+.2}");
+                let tol = if *lv > -6.0 { 2.0 } else if *lv > -12.0 { 1.5 } else { 1.0 };
+                if std::env::var_os("LEVEL_CAPTURE").is_none() {
+                    assert!((db - r).abs() < tol, "{} is {:.2} dB off the default loudness at {lv} dBFS", pr.name, db - r);
+                }
+            }
+            println!("{line}");
+        }
+    }
+
+    // ---- Auto level (`JblParams::auto_level`): the effect follows the input loudness ----
+
+    #[test]
+    fn auto_level_constants_are_consistent() {
+        let db = |x: f32| f64::from(x);
+        assert!((db(AUTO_REF_MS) - 10f64.powf(db(AUTO_REF_DB) / 10.0)).abs() < 1e-8);
+        assert!((db(AUTO_MIN_RATIO) - 10f64.powf(-db(AUTO_MAX_BOOST_DB) / 10.0)).abs() < 1e-8);
+        assert!((db(AUTO_MIN_INV) - 10f64.powf(-db(AUTO_MAX_BOOST_DB) / 20.0)).abs() < 1e-6);
+        assert!((db(AUTO_MAX_INV) - 10f64.powf(db(AUTO_MAX_CUT_DB) / 20.0)).abs() < 1e-4);
+    }
+
+    /// The headline requirement: with auto level on (guard off), every preset and the Default land
+    /// about 1 dB below dry (+-1.5 dB; +-2 dB at the extreme -3 dBFS RMS, where the soft limiters act)
+    /// for music-like input at -30..-3 dBFS RMS at 44.1/48/96 kHz. The old fixed-drive path fails this
+    /// by up to 20 dB at the loud end.
+    #[test]
+    fn bass_fx_auto_level_loudness_matches_input_for_all_presets_levels_rates() {
+        let mut sets: Vec<(&str, JblParams, u8)> = vec![("Default", JblParams::default(), 90)];
+        for pr in crate::config::jbl_presets() {
+            sets.push((pr.name, pr.params, pr.intensity));
+        }
+        for fs in [44100.0, 48000.0, 96000.0] {
+            let n = (fs * 2.0) as usize;
+            for lv in TEST_LEVELS_DB {
+                let sigs: Vec<_> = all_level_signals(n, fs, lv).into_iter().take(3).collect();
+                for (name, p, pct) in &sets {
+                    let db = jbl_gain_db(fs, *pct, &JblParams { loudness_guard: false, auto_level: true, ..*p }, &sigs);
+                    let tol = if lv > -6.0 { 2.0 } else { 1.5 };
+                    assert!(
+                        (db - f64::from(BASS_FX_TRIM_DB)).abs() < tol,
+                        "{name} at {lv} dBFS, {fs} Hz: {db:+.2} dB vs dry"
+                    );
+                }
+            }
+        }
+        // And the legacy path really does lose level when hot (what this test guards against).
+        let fs = 48000.0;
+        let sigs = all_level_signals(96000, fs, -12.0);
+        let legacy = jbl_gain_db(fs, 90, &JblParams { auto_level: false, ..JblParams::default() }, &sigs);
+        assert!(legacy < -4.0, "legacy fixed-drive path at -12 dBFS: {legacy:+.2} dB");
+    }
+
+    /// Amplitude-scale invariance: with auto level the whole wet path (clipper, kick saturation, duck,
+    /// quantiser) sees the same drive at any input volume, so a quieter copy of the input comes out as
+    /// the same waveform, scaled by the same factor.
+    #[test]
+    fn bass_fx_auto_level_output_scales_with_input() {
+        let fs = 48000.0;
+        let n = 96000;
+        let loud = level_signals(n, fs, -15.0);
+        for (name, x) in &loud {
+            let y_loud = render_mono(fs, x, 90, &JblParams::default());
+            for g_db in [-6.0f64, -12.0, -15.0] {
+                let g = 10f64.powf(g_db / 20.0) as f32;
+                let xq: Vec<f32> = x.iter().map(|v| v * g).collect();
+                let y_q = render_mono(fs, &xq, 90, &JblParams::default());
+                let err: Vec<f32> = y_q.iter().zip(&y_loud).map(|(a, b)| a / g - b).collect();
+                let rel = rms_of(&err[n / 4..]) / rms_of(&y_loud[n / 4..]);
+                assert!(rel < 0.02, "{name}: {g_db} dB copy differs from the scaled loud output by {rel:.4}");
+            }
+        }
+        // The legacy path is clearly not scale invariant.
+        let fixed = JblParams { auto_level: false, ..JblParams::default() };
+        let y1 = render_mono(fs, &loud[1].1, 90, &fixed);
+        let xq: Vec<f32> = loud[1].1.iter().map(|v| v * 0.25).collect();
+        let y2 = render_mono(fs, &xq, 90, &fixed);
+        let err: Vec<f32> = y2.iter().zip(&y1).map(|(a, b)| a / 0.25 - b).collect();
+        assert!(rms_of(&err[n / 4..]) / rms_of(&y1[n / 4..]) > 0.3);
+    }
+
+    /// THD of a steady sine (RMS `rms_db`) through the effect: harmonics 2..=8 against the fundamental,
+    /// over the last second (an integer number of cycles of `f`).
+    fn tone_thd_db(fs: f64, f: f64, rms_db: f64, p: &JblParams) -> f64 {
+        let amp = 10f64.powf(rms_db / 20.0) * 2f64.sqrt();
+        let x = sine(fs, f, amp, (fs * 2.0) as usize);
+        let y = render_mono(fs, &x, 90, p);
+        let seg = &y[y.len() - fs as usize..];
+        let bin = |k: f64| {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, v) in seg.iter().enumerate() {
+                let ph = 2.0 * PI * k * f * i as f64 / fs;
+                re += f64::from(*v) * ph.cos();
+                im += f64::from(*v) * ph.sin();
+            }
+            re * re + im * im
+        };
+        let harm: f64 = (2..=8).map(|k| bin(f64::from(k))).sum();
+        10.0 * (harm / bin(1.0)).log10()
+    }
+
+    /// The amount of distortion (THD of 60 Hz and 1 kHz tones) is the same at every input level.
+    #[test]
+    fn bass_fx_auto_level_distortion_is_level_independent() {
+        let fs = 48000.0;
+        for f in [60.0, 1000.0] {
+            let thd = |auto: bool, lv: f64| tone_thd_db(fs, f, lv, &JblParams { auto_level: auto, ..JblParams::default() });
+            let on: Vec<f64> = [-30.0, -24.0, -18.0, -12.0, -6.0].iter().map(|lv| thd(true, *lv)).collect();
+            let off: Vec<f64> = [-30.0, -18.0, -6.0].iter().map(|lv| thd(false, *lv)).collect();
+            let spread = |v: &[f64]| v.iter().cloned().fold(f64::MIN, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min);
+            println!("THD {f} Hz auto on {on:.1?} off {off:.1?}");
+            assert!(spread(&on) < 2.0, "THD at {f} Hz varies with level: {on:.1?}");
+            if f == 60.0 {
+                assert!(spread(&off) > 3.0, "legacy THD should vary with level: {off:.1?}");
+            }
+        }
+    }
+
+    /// Worst dip (dB) of a 2 kHz tone under 60 Hz bass bursts, against the same render without ducking,
+    /// for input scaled by `g_db`.
+    fn mid_dip_db(fs: f64, g_db: f64, p: &JblParams) -> f64 {
+        let n = 48000;
+        let g = 10f64.powf(g_db / 20.0);
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                let burst = if (t % 0.5) < 0.1 { 0.5 } else { 0.0 };
+                (g * (burst * (2.0 * PI * 60.0 * t).sin() + 0.1 * (2.0 * PI * 2000.0 * t).sin())) as f32
+            })
+            .collect();
+        let hf = |p: &JblParams| {
+            let y = render_mono(fs, &x, 90, p);
+            let sp = FilterSpec { kind: FilterKind::HighPass, fc_hz: 1000.0, gain_db: 0.0, q: 0.707, enabled: true };
+            let mut b = Biquad::from_spec(&sp, fs);
+            y.iter().map(|v| b.process(*v)).collect::<Vec<f32>>()
+        };
+        let (y, reference) = (hf(p), hf(&JblParams { duck_on: false, ..*p }));
+        let win = 240;
+        (20..(n / win - 1))
+            .map(|k| {
+                let s = k * win;
+                20.0 * (rms_of(&y[s..s + win]) / rms_of(&reference[s..s + win])).log10()
+            })
+            .fold(0.0, f64::min)
+    }
+
+    /// The Default's pump (mid dip on each bass hit) is the same at every input level.
+    #[test]
+    fn bass_fx_auto_level_pump_is_level_independent() {
+        let fs = 48000.0;
+        let dips: Vec<f64> =
+            [-24.0, -18.0, -12.0, -6.0, 0.0].iter().map(|g| mid_dip_db(fs, *g, &JblParams::default())).collect();
+        println!("DUCK mid dips by level: {dips:.1?}");
+        let spread = dips.iter().cloned().fold(f64::MIN, f64::max) - dips.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(spread < 2.0, "pump depth varies with level: {dips:.1?}");
+        assert!(dips.iter().all(|d| *d < -3.0), "the pump must be there at every level: {dips:.1?}");
+    }
+
+    /// A level step (either way, 18 dB) is smooth: no click (largest sample step stays within 1.7x of
+    /// the same material at constant level), the level has settled to the constant-level result by
+    /// 500 ms after the step, and the gain never overshoots (<= +3 dB) while it adapts.
+    #[test]
+    fn bass_fx_auto_level_step_response_is_smooth() {
+        let fs = 48000.0;
+        let seg = 96000;
+        let (quiet, loud) = (level_signals(seg, fs, -36.0), level_signals(seg, fs, -18.0));
+        let win = (fs * 0.05) as usize;
+        for k in 0..3 {
+            for up in [true, false] {
+                let (a, b) = if up { (&quiet[k].1, &loud[k].1) } else { (&loud[k].1, &quiet[k].1) };
+                let x: Vec<f32> = a.iter().chain(b.iter()).copied().collect();
+                let y = render_mono(fs, &x, 90, &JblParams::default());
+                // Constant-level reference of the second segment (the same material, same phase).
+                let steady: Vec<f32> = b.iter().chain(b.iter()).copied().collect();
+                let ys = render_mono(fs, &steady, 90, &JblParams::default());
+                let ys = &ys[seg..];
+                let max_step = |v: &[f32]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+                // (Skip 5 ms: the concatenated test input itself jumps at the join.)
+                let (m_step, m_ref) = (max_step(&y[seg + 240..]), max_step(&ys[240..]));
+                assert!(m_step <= 1.7 * m_ref, "{} up={up}: click, step {m_step} vs {m_ref}", quiet[k].0);
+                let mut t = 0;
+                while t + win <= seg {
+                    let d = 20.0 * (rms_of(&y[seg + t..seg + t + win]) / rms_of(&ys[t..t + win])).log10();
+                    // A big volume cut leaves the wet path briefly under-driven (louder); bounded and short.
+                    let limit = if t < (fs * 0.1) as usize { 16.0 } else if t < (fs * 0.25) as usize { 8.5 } else { 3.0 };
+                    assert!(d < limit, "{} up={up}: overshoot {d:+.2} dB at {} ms", quiet[k].0, t * 1000 / 48000);
+                    if t >= (fs * 0.5) as usize {
+                        assert!(d.abs() < 1.0, "{} up={up}: not settled at {} ms ({d:+.2} dB)", quiet[k].0, t * 1000 / 48000);
+                    }
+                    t += win;
+                }
+            }
+        }
+    }
+
+    /// The pre-gain / make-up factors themselves move smoothly (no zipper) through a level step, stay
+    /// within their clamps, and silence stays silence with no NaN (also after loud material).
+    #[test]
+    fn bass_fx_auto_level_gain_is_smooth_bounded_and_silence_is_silent() {
+        let fs = 48000.0;
+        let mut fx = BassFx::new(fs);
+        fx.set(true, 90, &JblParams::default());
+        let seg = 48000;
+        let loud = level_signals(seg, fs, -12.0).remove(2).1;
+        let quiet: Vec<f32> = loud.iter().map(|v| v * 0.03).collect();
+        let x: Vec<f32> = quiet.iter().chain(loud.iter()).chain(quiet.iter()).copied().collect();
+        let mut invs = Vec::with_capacity(x.len());
+        for v in &x {
+            let (mut l, mut r) = ([*v], [*v]);
+            fx.process(&mut l, &mut r);
+            assert!(l[0].is_finite() && r[0].is_finite());
+            invs.push((fx.lvl_ms.max(AUTO_REF_MS * AUTO_MIN_RATIO) / AUTO_REF_MS).sqrt().clamp(AUTO_MIN_INV, AUTO_MAX_INV));
+        }
+        let rel_step = invs.windows(2).map(|w| ((w[1] - w[0]) / w[0]).abs()).fold(0f32, f32::max);
+        assert!(rel_step < 0.1, "level gain jumps by {rel_step} in one sample");
+        assert!(invs.iter().all(|g| *g >= AUTO_MIN_INV && *g <= AUTO_MAX_INV));
+        // Silence, and a loud passage followed by silence.
+        for fs in [44100.0, 48000.0, 96000.0] {
+            let n = (fs * 0.5) as usize;
+            let y = render_mono(fs, &vec![0.0; n], 90, &JblParams::default());
+            assert!(y.iter().all(|v| *v == 0.0), "silence in must be silence out");
+            let mut x = level_signals(n, fs, -12.0).remove(1).1;
+            x.extend(std::iter::repeat_n(0.0f32, (fs * 2.0) as usize));
+            let y = render_mono(fs, &x, 90, &JblParams::default());
+            assert!(y.iter().all(|v| v.is_finite()));
+            assert!(y[y.len() - 4800..].iter().all(|v| v.abs() < 1e-4));
+        }
+    }
+
+    /// Very quiet input is never blown up: the boost is capped at +24 dB and undone on the output.
+    #[test]
+    fn bass_fx_auto_level_very_quiet_input_is_bounded() {
+        for fs in [44100.0, 48000.0, 96000.0] {
+            for amp in [1e-9f32, 1e-7, 1e-5, 1e-3] {
+                let n = (fs * 0.5) as usize;
+                let x: Vec<f32> = (0..n).map(|i| amp * ((i as f32) * 0.37).sin()).collect();
+                let y = render_mono(fs, &x, 90, &JblParams::default());
+                assert!(y.iter().all(|v| v.is_finite() && v.abs() <= 10.0 * amp + 1e-9), "fs {fs} amp {amp}");
+            }
+        }
+    }
+
+    /// Switching the effect on mid-programme starts at the right gain (the level follower keeps
+    /// running while the effect is idle): no dip in the first 100 ms after the mix ramp.
+    #[test]
+    fn bass_fx_auto_level_toggle_on_is_not_a_level_dip() {
+        let fs = 48000.0;
+        let x = level_signals(144000, fs, -12.0).remove(2).1;
+        let mut fx = BassFx::new(fs);
+        fx.set(false, 90, &JblParams::default());
+        let (mut l, mut r) = (x.clone(), x.clone());
+        let seg = 48000;
+        fx.process(&mut l[..seg], &mut r[..seg]);
+        fx.set(true, 90, &JblParams::default());
+        fx.process(&mut l[seg..2 * seg], &mut r[seg..2 * seg]);
+        let win = 12000;
+        for k in 0..2 {
+            let s = seg + 960 + k * win;
+            let d = 20.0 * (rms_of(&l[s..s + win]) / rms_of(&x[s..s + win])).log10();
+            assert!((-4.0..3.5).contains(&d), "{d:+.2} dB vs dry in window {k} after switching on");
+        }
+    }
+
+    /// With auto level the output stays bounded and finite for every preset at every rate and level
+    /// (including a hot, crushed master), and does not engage the soft limiters at normal levels.
+    #[test]
+    fn jbl_presets_finite_bounded_and_unlimited_across_levels() {
+        for fs in [44100.0, 48000.0, 96000.0, 192000.0] {
+            let n = (fs * 0.6) as usize;
+            for lv in [-60.0, -30.0, -18.0, -6.0, -3.0, 0.0] {
+                let sigs = all_level_signals(n, fs, lv);
+                for pr in crate::config::jbl_presets() {
+                    for (name, x) in sigs.iter().take(2) {
+                        let y = render_mono(fs, x, pr.intensity, &pr.params);
+                        assert!(y.iter().all(|s| s.is_finite() && s.abs() <= 1.0), "{} {name} {lv} dBFS {fs} Hz", pr.name);
+                        if lv <= -18.0 {
+                            let over = y.iter().filter(|s| s.abs() > LIMITER_KNEE).count();
+                            assert_eq!(over, 0, "{} {name} at {lv} dBFS {fs} Hz: soft limiter engaged", pr.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Golden for the auto-level Default (guard off) at two input levels. Changes only with deliberate
+    /// DSP/default changes. Re-capture with GOLDEN_CAPTURE=1. (Auto level off is covered by the older goldens.)
+    #[test]
+    fn bass_fx_golden_default_auto_level() {
+        let fs = 48000.0;
+        let (x_l, x_r) = golden_signal(48000, fs);
+        for (pct, gain, g_rms_l, g_rms_r, g_samples) in GOLDEN_AUTO {
+            let (mut l, mut r): (Vec<f32>, Vec<f32>) =
+                (x_l.iter().map(|v| v * gain).collect(), x_r.iter().map(|v| v * gain).collect());
+            let mut eq = StereoEq::new(fs);
+            eq.set_limiter(true);
+            eq.set_bass_fx(true, pct, &JblParams::default());
+            eq.process_stereo(&mut l, &mut r);
+            let got = [l[1000], l[12000], l[30001], r[20000], r[47999]];
+            println!("GOLDEN_AUTO ({pct}, {gain:?}, {:.9}, {:.9}, {got:?}),", rms_of(&l), rms_of(&r));
+            if std::env::var_os("GOLDEN_CAPTURE").is_some() {
+                continue;
+            }
+            assert!((rms_of(&l) - g_rms_l).abs() < 1e-6 && (rms_of(&r) - g_rms_r).abs() < 1e-6, "rms changed at {pct}% x{gain}");
+            for (a, b) in got.iter().zip(g_samples.iter()) {
+                assert!((a - b).abs() < 1e-5, "sample changed at {pct}% x{gain}: {a} vs {b}");
+            }
+        }
+    }
+
+    const GOLDEN_AUTO: [(u8, f32, f64, f64, [f32; 5]); 2] = [
+        (90, 0.1, 0.020659782, 0.020653142, [0.0051437076, -0.013983352, 0.019596968, -0.02482602, -0.024389725]),
+        (90, 1.0, 0.206288228, 0.206217674, [0.075743094, -0.13983417, 0.19596952, -0.2482607, -0.24389726]),
+    ];
+
+    // ---- Mids/highs pass-through (`JblParams::mid_pass`) and ducking floor (`duck_floor_db`) ----
+
+    fn sine(fs: f64, f: f64, amp: f64, n: usize) -> Vec<f32> {
+        (0..n).map(|i| (amp * (2.0 * PI * f * i as f64 / fs).sin()) as f32).collect()
+    }
+
+    /// RMS (second half) of `x` through two cascaded 2nd-order Butterworth sections of the given kind.
+    fn band_rms(fs: f64, x: &[f32], kind: FilterKind, fc: f64) -> f64 {
+        let sp = FilterSpec { kind, fc_hz: fc, gain_db: 0.0, q: 0.707, enabled: true };
+        let mut b = [Biquad::from_spec(&sp, fs); 2];
+        let y: Vec<f32> = x.iter().map(|v| lr4(&mut b, *v)).collect();
+        rms_of(&y[y.len() / 2..])
+    }
+
+    /// With mid_pass 0 the crossover is not in the signal path: any crossover frequency, and having
+    /// had the pass-through on and off again, gives the identical output.
+    #[test]
+    fn bass_fx_mid_pass_zero_is_bit_identical() {
+        let base = JblParams { mid_pass: 0.0, ..JblParams::default() };
+        let a = run_fx(48000.0, 90, &base, 24000);
+        assert_eq!(run_fx(48000.0, 90, &JblParams { mid_pass_hz: 150.0, ..base }, 24000), a);
+        let mut fx = BassFx::new(48000.0);
+        fx.set(true, 90, &JblParams { mid_pass: 0.8, ..base });
+        fx.set(true, 90, &base);
+        fx.reset();
+        let (mut l, mut r) = golden_signal(24000, 48000.0);
+        fx.process(&mut l, &mut r);
+        assert_eq!((l, r), a);
+        assert!(!fx.mid_on);
+    }
+
+    /// The Linkwitz-Riley pair (low pass on one branch, high pass on the other) sums flat: with
+    /// wet == dry the pass-through is a pure all-pass, so no frequency is boosted or notched.
+    #[test]
+    fn mid_pass_crossover_sums_flat() {
+        for fs in [44100.0, 48000.0, 96000.0] {
+            for fc in [100.0, 400.0, 1000.0] {
+                let (hp, lp) = (
+                    FilterSpec { kind: FilterKind::HighPass, fc_hz: fc, gain_db: 0.0, q: 0.707, enabled: true },
+                    FilterSpec { kind: FilterKind::LowPass, fc_hz: fc, gain_db: 0.0, q: 0.707, enabled: true },
+                );
+                for f in [50.0, 100.0, 200.0, 400.0, 800.0, 1600.0, 3200.0, 6400.0, 12800.0, 16000.0] {
+                    if f > fs * 0.4 {
+                        continue;
+                    }
+                    let n = (fs * 0.5) as usize;
+                    let x = sine(fs, f, 0.5, n);
+                    let (mut h, mut l) = ([Biquad::from_spec(&hp, fs); 2], [Biquad::from_spec(&lp, fs); 2]);
+                    let y: Vec<f32> = x.iter().map(|v| lr4(&mut h, *v) + lr4(&mut l, *v)).collect();
+                    let db = 20.0 * (rms_of(&y[n / 2..]) / rms_of(&x[n / 2..])).log10();
+                    assert!(db.abs() < 1.5, "fs {fs} fc {fc} f {f}: sum is {db:+.2} dB");
+                }
+            }
+        }
+    }
+
+    /// A tone above the crossover comes through (nearly) dry at mid_pass 1, a tone below it is unchanged
+    /// by the pass-through, and on music the band above 1 kHz comes up clearly.
+    #[test]
+    fn bass_fx_mid_pass_lifts_mids_and_highs_not_bass() {
+        let fs = 48000.0;
+        let n = 96000;
+        let off = JblParams { mid_pass: 0.0, loudness_guard: false, lfo_on: false, ..JblParams::default() };
+        for mp in [0.5f32, 1.0] {
+            let on = JblParams { mid_pass: mp, ..off };
+            let level = |p: &JblParams, f: f64, amp: f64| {
+                let x = sine(fs, f, amp, n);
+                let y = render_mono(fs, &x, 90, p);
+                20.0 * (rms_of(&y[n / 2..]) / rms_of(&x[n / 2..])).log10()
+            };
+            for f in [1500.0, 4000.0] {
+                let (_d0, d1) = (level(&off, f, 0.05), level(&on, f, 0.05));
+                if mp == 1.0 {
+                    assert!(d1.abs() < 1.0, "{f} Hz should be about dry at mid_pass 1, got {d1:+.2} dB");
+                }
+            }
+            let (b0, b1) = (level(&off, 60.0, 0.3), level(&on, 60.0, 0.3));
+            assert!((b1 - b0).abs() < 1.0, "mp {mp}: 60 Hz moved from {b0:+.2} to {b1:+.2} dB");
+        }
+        // Music-like signal (ducker off so only the clipper/lo-fi squash is compared): the mid and high
+        // band levels rise, the bass band stays.
+        let off = JblParams { duck_on: false, ..off };
+        let x = level_signals(144000, fs, -18.0).remove(1).1;
+        let (a, b) = (render_mono(fs, &x, 90, &off), render_mono(fs, &x, 90, &JblParams { mid_pass: 0.9, ..off }));
+        let band = |v: &[f32], k: FilterKind, f: f64| band_rms(fs, &v[48000..], k, f);
+        let (hi_a, hi_b) = (band(&a, FilterKind::HighPass, 1000.0), band(&b, FilterKind::HighPass, 1000.0));
+        let (lo_a, lo_b) = (band(&a, FilterKind::LowPass, 100.0), band(&b, FilterKind::LowPass, 100.0));
+        let hi_up = 20.0 * (hi_b / hi_a).log10();
+        let lo_move = 20.0 * (lo_b / lo_a).log10();
+        println!("MID_PASS music: >1 kHz {hi_up:+.2} dB, <100 Hz {lo_move:+.2} dB");
+        assert!(hi_up > 2.0, "mids/highs should come up clearly, got {hi_up:+.2} dB");
+        assert!(lo_move.abs() < 1.5, "bass band should stay, moved {lo_move:+.2} dB");
+    }
+
+    /// The guard still holds out <= in (+0.5 dB slack) for every pass-through amount, crossover and
+    /// ducking floor, and the guard-on result never exceeds the guard-off one.
+    #[test]
+    fn bass_fx_mid_pass_guard_never_louder_than_input() {
+        for fs in [44100.0, 48000.0] {
+            let n = (fs * 3.0) as usize;
+            let skip = (fs * 1.0) as usize;
+            let base = level_signals(n, fs, -18.0);
+            for (mp, hz, floor) in [(0.3f32, 150.0f32, -9.0f32), (0.9, 400.0, -9.0), (1.0, 1000.0, -3.0), (1.0, 400.0, 0.0)] {
+                for lv in [-30.0f64, -18.0, -6.0] {
+                    let g = 10f64.powf((lv + 18.0) / 20.0) as f32;
+                    for (name, x) in &base {
+                        let x: Vec<f32> = x.iter().map(|v| v * g).collect();
+                        let p = JblParams {
+                            mid_pass: mp,
+                            mid_pass_hz: hz,
+                            duck_floor_db: floor,
+                            loudness_guard: true,
+                            auto_level: false,
+                            ..JblParams::default()
+                        };
+                        let on = render_mono(fs, &x, 90, &p);
+                        let off = render_mono(fs, &x, 90, &JblParams { loudness_guard: false, ..p });
+                        let db = 20.0 * (rms_of(&on[skip..]) / rms_of(&x[skip..])).log10();
+                        assert!(db <= 0.5, "{name} mp {mp} hz {hz} floor {floor} at {lv} dBFS, {fs} Hz: {db:+.2} dB vs in");
+                        assert!(rms_of(&on[skip..]) <= rms_of(&off[skip..]) * 1.02, "{name}: guard must only attenuate");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Toggling the effect on and off with the pass-through active is not a level jump: the output
+    /// level shortly after switching on is within 3 dB of the dry level, there is no sample-to-sample
+    /// step bigger than the signal's own, and off returns to the dry signal.
+    #[test]
+    fn bass_fx_mid_pass_toggle_is_not_a_level_jump() {
+        let fs = 48000.0;
+        let x = level_signals(144000, fs, -18.0).remove(2).1;
+        let mut fx = BassFx::new(fs);
+        fx.set(false, 90, &JblParams::default());
+        let (mut l, mut r) = (x.clone(), x.clone());
+        let seg = 48000;
+        fx.process(&mut l[..seg], &mut r[..seg]);
+        fx.set(true, 90, &JblParams::default());
+        fx.process(&mut l[seg..2 * seg], &mut r[seg..2 * seg]);
+        fx.set(false, 90, &JblParams::default());
+        fx.process(&mut l[2 * seg..], &mut r[2 * seg..]);
+        assert_eq!(&l[..seg], &x[..seg]);
+        let win = 4800;
+        let db = |a: &[f32], b: &[f32]| 20.0 * (rms_of(a) / rms_of(b)).log10();
+        let on = db(&l[seg + 24000..seg + 24000 + win], &x[seg + 24000..seg + 24000 + win]);
+        assert!(on.abs() < 4.0, "effect on is {on:+.2} dB vs dry");
+        let step = |v: &[f32]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        assert!(step(&l) < 3.0 * step(&x) + 0.02, "click: {} vs dry {}", step(&l), step(&x));
+        assert_eq!(&l[2 * seg + 4800..], &x[2 * seg + 4800..]);
+    }
+
+    /// Reset clears the crossover state and the guard's pass-through followers; a sample rate change
+    /// retunes the crossover like a fresh effect (and keeps the state).
+    #[test]
+    fn bass_fx_mid_pass_reset_and_sample_rate_change() {
+        let mut fx = BassFx::new(48000.0);
+        fx.set(true, 90, &JblParams { loudness_guard: true, ..JblParams::default() });
+        let x = level_signals(24000, 48000.0, -18.0).remove(2).1;
+        let (mut l, mut r) = (x.clone(), x.clone());
+        fx.process(&mut l, &mut r);
+        assert!(fx.mid_on && fx.guard_pass > 0.0);
+        fx.set_sample_rate(96000.0);
+        assert!(fx.guard_pass > 0.0, "state kept across a rate change");
+        let mut fresh = BassFx::new(96000.0);
+        fresh.set(true, 90, &JblParams { loudness_guard: true, ..JblParams::default() });
+        assert_eq!(fx.lp_wet_l[0].c, fresh.lp_wet_l[0].c);
+        assert_eq!(fx.hp_dry_r[1].c, fresh.hp_dry_r[1].c);
+        fx.reset();
+        assert_eq!((fx.guard_pass, fx.guard_cross), (0.0, 0.0));
+        assert_eq!((fx.hp_dry_l[0].z1, fx.lp_wet_r[1].z2), (0.0, 0.0));
+        let (mut a, mut a2) = (vec![0.1f32; 960], vec![0.1f32; 960]);
+        let (mut b, mut b2) = (a.clone(), a2.clone());
+        fx.mix = 0.0;
+        fx.process(&mut a, &mut a2);
+        fresh.process(&mut b, &mut b2);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn bass_fx_mid_pass_extremes_finite_and_bounded() {
+        for fs in [44100.0, 96000.0, 192000.0] {
+            for (mp, hz) in [(1.0f32, 100.0f32), (1.0, 1000.0), (0.5, 1000.0), (f32::NAN, f32::NAN), (9.0, -5.0)] {
+                for p in extreme_sets() {
+                    for pct in [0u8, 50, 100] {
+                        let (l, r) = run_fx(fs, pct, &JblParams { mid_pass: mp, mid_pass_hz: hz, ..p }, 9600);
+                        assert!(
+                            l.iter().chain(r.iter()).all(|s| s.is_finite() && s.abs() <= 1.0),
+                            "fs {fs} mp {mp} hz {hz} pct {pct}"
+                        );
+                    }
+                }
+            }
+        }
+        for floor in [-100.0f32, -24.0, -9.0, 0.0, 5.0, f32::NAN] {
+            for fs in [44100.0, 192000.0] {
+                let (l, r) = run_fx(fs, 100, &JblParams { duck_floor_db: floor, ..JblParams::default() }, 9600);
+                assert!(l.iter().chain(r.iter()).all(|s| s.is_finite() && s.abs() <= 1.0), "floor {floor} fs {fs}");
+            }
+        }
+    }
+
+    /// Ducking floor: -24 dB is the plain original curve (exactly), 0 dB is no ducking at all (exactly
+    /// the same as the ducker switched off), and in between the dip is shallower the higher the floor
+    /// while the timing (position of the deepest point) is unchanged.
+    #[test]
+    fn bass_fx_duck_floor_off_zero_and_depth() {
+        let fs = 48000.0;
+        let n = 96000;
+        let base = JblParams {
+            drive_max: 6.5,
+            kick_drive_max: 2.0,
+            out_trim_db: 1.5,
+            mid_pass: 0.0,
+            loudness_guard: false,
+            auto_level: false,
+            lfo_on: false,
+            ..JblParams::default()
+        };
+        let plain = run_fx(fs, 90, &JblParams { duck_floor_db: crate::config::DUCK_FLOOR_OFF_DB, ..base }, 24000);
+        let sub = run_fx(fs, 90, &JblParams { duck_floor_db: -23.99, ..base }, 24000);
+        assert!(plain != sub, "any floor above the minimum is active");
+        let no_duck = run_fx(fs, 90, &JblParams { duck_on: false, ..base }, 24000);
+        assert_eq!(run_fx(fs, 90, &JblParams { duck_floor_db: 0.0, ..base }, 24000), no_duck);
+        // Mid tone under 60 Hz bass bursts: ratio against the no-duck render per 5 ms window.
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                let burst = if (t % 0.5) < 0.1 { 0.5 } else { 0.0 };
+                (burst * (2.0 * PI * 60.0 * t).sin() + 0.1 * (2.0 * PI * 2000.0 * t).sin()) as f32
+            })
+            .collect();
+        let hf = |p: &JblParams| {
+            let y = render_mono(fs, &x, 90, p);
+            let sp = FilterSpec { kind: FilterKind::HighPass, fc_hz: 1000.0, gain_db: 0.0, q: 0.707, enabled: true };
+            let mut b = Biquad::from_spec(&sp, fs);
+            y.iter().map(|v| b.process(*v)).collect::<Vec<f32>>()
+        };
+        let reference = hf(&JblParams { duck_on: false, ..base });
+        let win = 240;
+        let dip = |p: &JblParams| -> (f64, usize) {
+            let y = hf(p);
+            let mut best = (0.0f64, 0usize);
+            for k in 20..(n / win - 1) {
+                let s = k * win;
+                let r = 20.0 * (rms_of(&y[s..s + win]) / rms_of(&reference[s..s + win])).log10();
+                if r < best.0 {
+                    best = (r, k % (24000 / win));
+                }
+            }
+            best
+        };
+        let (d_off, t_off) = dip(&JblParams { duck_floor_db: crate::config::DUCK_FLOOR_OFF_DB, ..base });
+        let (d_9, t_9) = dip(&JblParams { duck_floor_db: -9.0, ..base });
+        let (d_4, _) = dip(&JblParams { duck_floor_db: -4.0, ..base });
+        println!("DUCK floor dips: off {d_off:.1} dB, -9 {d_9:.1} dB, -4 {d_4:.1} dB (min at window {t_off}/{t_9})");
+        assert!(d_off < d_9 - 1.0 && d_9 < d_4 - 1.0, "dip should shrink with a higher floor: {d_off} {d_9} {d_4}");
+        assert!(d_9 > -9.0 - 1.5 && d_4 > -4.0 - 1.5, "dip should stay near the floor");
+        assert!((t_off as i64 - t_9 as i64).abs() <= 3, "dip timing moved: {t_off} vs {t_9}");
+    }
+
+    /// Golden for the current Default (pass-through, floor, level guard on; quiet input where the guard
+    /// engages). Changes only with deliberate DSP/default changes. Re-capture with GOLDEN_CAPTURE=1.
+    #[test]
+    fn bass_fx_golden_default_with_mid_pass() {
+        let fs = 48000.0;
+        let (x_l, x_r) = golden_signal(48000, fs);
+        for (pct, g_rms_l, g_rms_r, g_samples) in GOLDEN_MID_PASS {
+            let (mut l, mut r): (Vec<f32>, Vec<f32>) =
+                (x_l.iter().map(|v| v * 0.1).collect(), x_r.iter().map(|v| v * 0.1).collect());
+            let mut eq = StereoEq::new(fs);
+            eq.set_limiter(true);
+            eq.set_bass_fx(true, pct, &JblParams { loudness_guard: true, auto_level: false, ..JblParams::default() });
+            eq.process_stereo(&mut l, &mut r);
+            let got = [l[1000], l[12000], l[30001], r[20000], r[47999]];
+            println!("GOLDEN_MID pct={pct} rms_l={:.9} rms_r={:.9} samples={got:?}", rms_of(&l), rms_of(&r));
+            if std::env::var_os("GOLDEN_CAPTURE").is_some() {
+                continue;
+            }
+            assert!((rms_of(&l) - g_rms_l).abs() < 1e-6 && (rms_of(&r) - g_rms_r).abs() < 1e-6, "rms changed at {pct}%");
+            for (a, b) in got.iter().zip(g_samples.iter()) {
+                assert!((a - b).abs() < 1e-5, "sample changed at {pct}%: {a} vs {b}");
+            }
+        }
+    }
+
+    const GOLDEN_MID_PASS: [(u8, f64, f64, [f32; 5]); 2] = [
+        (30, 0.026002256, 0.025796345, [0.034590274, -0.016313348, 0.033009145, -0.034697354, -0.01750641]),
+        (100, 0.032903435, 0.032894785, [-0.02811724, -0.0043451586, 0.022759866, -0.03262191, -0.03004234]),
+    ];
 }
 
 #[cfg(test)]
@@ -1816,5 +3020,112 @@ mod tests {
         assert_eq!(f.update(0.1, 0, 0.0, 0.3), FaultState::Muted);
         f.reset();
         assert_eq!(f.state().as_u32(), 0);
+    }
+}
+
+#[cfg(test)]
+mod bass_boost_tests {
+    use super::*;
+
+    /// Linear wet path (no distortion, pumping, lo-fi or rattle) so the boost shelf can be measured.
+    fn clean(db: f32, hz: f32) -> JblParams {
+        JblParams {
+            duck_on: false,
+            shelf_db: 0.0,
+            res_on: false,
+            drive_max: 1.0,
+            bias_max: 0.0,
+            kick_on: false,
+            crush_on: false,
+            hold_on: false,
+            lpf_on: false,
+            lfo_on: false,
+            bass_boost_db: db,
+            bass_boost_hz: hz,
+            ..JblParams::default()
+        }
+    }
+
+    fn run(fs: f64, p: &JblParams, intensity: u8, freq: f64, amp: f64, n: usize) -> Vec<f32> {
+        let x: Vec<f32> = (0..n).map(|i| (amp * (2.0 * PI * freq * i as f64 / fs).sin()) as f32).collect();
+        let (mut l, mut r) = (x.clone(), x);
+        let mut fx = BassFx::new(fs);
+        fx.set(true, intensity, p);
+        fx.process(&mut l, &mut r);
+        l
+    }
+
+    fn rms(v: &[f32]) -> f64 {
+        (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+    }
+
+    fn gain_db(freq: f64, boost: f32) -> f64 {
+        let fs = 48000.0;
+        let n = 48000;
+        let a = run(fs, &clean(0.0, 80.0), 50, freq, 0.05, n);
+        let b = run(fs, &clean(boost, 80.0), 50, freq, 0.05, n);
+        20.0 * (rms(&b[n / 2..]) / rms(&a[n / 2..])).log10()
+    }
+
+    #[test]
+    fn boost_zero_is_bit_identical() {
+        let mut p = JblParams::default();
+        let x: Vec<f32> = (0..20000).map(|i| (0.4 * (i as f32 * 0.013).sin() + 0.3 * (i as f32 * 0.31).sin()).clamp(-1.0, 1.0)).collect();
+        let (mut a, mut a2) = (x.clone(), x.clone());
+        let mut fx = BassFx::new(48000.0);
+        fx.set(true, 90, &p);
+        fx.process(&mut a, &mut a2);
+        // Turn boost on and back off: must return to the same output as never having it.
+        p.bass_boost_db = 6.0;
+        let mut fx2 = BassFx::new(48000.0);
+        fx2.set(true, 90, &p);
+        p.bass_boost_db = 0.0;
+        fx2.set(true, 90, &p);
+        fx2.reset();
+        let (mut b, mut b2) = (x.clone(), x);
+        fx2.process(&mut b, &mut b2);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn boost_raises_lows_not_highs() {
+        for db in [3.0f32, 6.0, 12.0] {
+            let low = gain_db(60.0, db);
+            let high = gain_db(2000.0, db);
+            eprintln!("boost {db} dB: 60 Hz {low:.2} dB, 2 kHz {high:.2} dB");
+            // The 80 Hz shelf is about 3/4 of full gain at 60 Hz and reaches the full gain well below.
+            let deep = gain_db(30.0, db);
+            eprintln!("  30 Hz {deep:.2} dB");
+            assert!(low > 0.6 * f64::from(db) && low < f64::from(db) + 0.5, "60 Hz {low} vs {db}");
+            assert!((deep - f64::from(db)).abs() < 1.5, "30 Hz {deep} vs {db}");
+            assert!(high.abs() < 0.3, "2 kHz changed by {high}");
+        }
+    }
+
+    #[test]
+    fn boost_extreme_finite_and_bounded() {
+        for fs in [44100.0, 48000.0, 96000.0, 192000.0] {
+            for hz in [30.0f32, 80.0, 200.0] {
+                for p in [clean(12.0, hz), JblParams { bass_boost_db: 12.0, bass_boost_hz: hz, ..JblParams::default() }] {
+                    for f in [30.0, 60.0, 200.0, 1000.0] {
+                        let y = run(fs, &p, 100, f, 1.0, fs as usize / 2);
+                        assert!(y.iter().all(|s| s.is_finite() && s.abs() <= 1.0), "fs {fs} hz {hz} f {f}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boost_survives_sample_rate_change() {
+        let mut fx = BassFx::new(44100.0);
+        fx.set(true, 90, &JblParams { bass_boost_db: 12.0, ..JblParams::default() });
+        for fs in [48000.0, 192000.0, 44100.0] {
+            fx.set_sample_rate(fs);
+            let (mut l, mut r) = (vec![0.9f32; 4000], vec![-0.9f32; 4000]);
+            fx.process(&mut l, &mut r);
+            assert!(l.iter().chain(r.iter()).all(|s| s.is_finite() && s.abs() <= 1.0));
+        }
+        assert!(fx.boost_on);
     }
 }

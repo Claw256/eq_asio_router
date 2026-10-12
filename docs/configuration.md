@@ -83,49 +83,85 @@ Status fields (in `EngineStatus`, not in the 128-byte status block, which is unc
 
 ### JBL Bass Mode
 
-`jbl_bass_mode` (bool, default `false`) turns the car-subwoofer effect on (bass shelf, resonance, clipping distortion, bass-keyed pumping, lo-fi) after the EQ. `jbl_intensity` (0..100, default 80) is the master scaler. The `[jbl]` table exposes the individual stages. Every value in it is the endpoint reached at 100 % Intensity; lower Intensity interpolates from the idle (neutral) value toward it. The defaults were tuned against measurements (see `crates/eq-core/tests/jbl_audit.rs`): the pump depth, release and attack sit in the usual sidechain ranges, and the resonance is a broad box-like boost rather than a narrow ring. A missing `[jbl]` table or key uses the default. Out-of-range values are clamped by `Config::sanitized()`; NaN/infinity becomes the default. Configs saved by an earlier version carry their old explicit `[jbl]` values (previous defaults: `res_db = 9.0`, `res_q = 3.0`, `drive_max = 5.0`); delete those keys or use "Reset to defaults" to adopt the new ones. All changes apply live.
+`jbl_bass_mode` (bool, default `false`) turns the car-subwoofer effect on (bass shelf, resonance, clipping distortion, bass-keyed pumping, lo-fi) after the EQ. `jbl_intensity` (0..100, default 90) is the master scaler. The `[jbl]` table exposes the individual stages. Every value in it is the endpoint reached at 100 % Intensity; lower Intensity interpolates from the idle (neutral) value toward it. The defaults are deliberately exaggerated ("fun"): deeper pumping, a bigger shelf and resonance, more drive and the Rattle LFO on, with the loudness compensated to about 1 dB below dry at any input volume (see "Auto level" below; the optional "Level guard" can additionally cap it at the input loudness). They were tuned against measurements (see `crates/eq-core/tests/jbl_audit.rs`): the pump depth, release and attack sit in the usual sidechain ranges, and the resonance is a broad box-like boost rather than a narrow ring. The mids and highs were later lifted (loudness-matched, versus the previous defaults) by easing the clipper and opening the treble low-pass (shelf 14 to 10 dB, resonance 9 to 6.5 dB, drive 5.5 to 8, kick drive 3.0 (unchanged), release 150 to 120 ms, low-pass 14000/7500 to 16000/10000 Hz), by a small **mids/highs pass-through** (`mid_pass`, below: first 0.9, then cut to 0.15 so the bass takes over and the whole signal distorts and ducks again; at 0.9 the 1 kHz THD was only -38.5 dB and the sound stayed clean, now it is about -19 dB, with a per-kick mid-band dip of about -15 dB versus dry), and by the **ducking floor** (`duck_floor_db`, below). The ducking itself is unchanged (`duck_depth = 4.0`, attack 5 ms, release 120 ms: same curve, timing and rhythm); the floor only limits how far the level may drop on a bass hit (default -9 dB, measured per-kick mid-band dip about 3.6 dB instead of about 7 dB, so the ducked level is about 3.5 dB louder while the pumping stays clearly audible). The small pass-through is ducked together with the rest, so the pump moves the vocals too. The Default's `out_trim_db` is +1.1 dB (part of the loudness calibration, which lands the effect about 1 dB below dry, measured). A missing `[jbl]` table or key uses the default. Out-of-range values are clamped by `Config::sanitized()`; NaN/infinity becomes the default. Configs saved by an earlier version carry their old explicit `[jbl]` values (older defaults: `duck_depth = 2.0`, `duck_release_ms = 120.0`, `shelf_db = 12.0`, `res_db = 6.0`, `res_q = 2.0`, `drive_max = 4.0`, `kick_drive_max = 2.2`, `lfo_on = false`, `lfo_rate_hz = 6.0`, intensity 80); delete those keys (a `[jbl]` table without `mid_pass` or `duck_floor_db` loads them as 0 and -24 = off, i.e. it keeps its old sound; a missing `mid_pass_hz` is 400), pick the "Default" preset or use "Reset to defaults" to adopt the new ones. The other presets keep their own values and were only re-trimmed in loudness. A config saved before **Auto level** existed has no `auto_level` key and loads as `true` (the explicit `[jbl]` values are kept, so such a sound now follows the input level; set `auto_level = false` for the old fixed-drive behaviour). All changes apply live.
 
 | Key | Default | Range | Meaning |
 |---|---|---|---|
 | `duck_on` | `true` | | Pumping: lower the level on each bass hit |
-| `duck_depth` | `2.0` | 0..6 | How far the level is pulled down |
+| `duck_depth` | `4.0` | 0..6 | How far the level is pulled down |
+| `duck_floor_db` | `-9.0` | -24..0 | Ducking floor: the most the ducker may lower the level on a bass hit (curve shape, attack and release unchanged). -24 = no floor (the plain curve; the other presets and a missing key), 0 = no ducking. Higher = louder while pumping. GUI: Advanced > Pump > Floor |
 | `duck_attack_ms` | `5.0` | 0.5..50 | Duck attack time |
 | `duck_release_ms` | `120.0` | 10..800 | Duck release time |
 | `detect_hz` | `100.0` | 40..250 | Bass detector frequency that triggers the pumping |
 | `shelf_hz` | `70.0` | 30..200 | Low-shelf corner frequency |
-| `shelf_db` | `12.0` | 0..18 | Low-shelf boost |
+| `shelf_db` | `10.0` | 0..18 | Low-shelf boost |
 | `res_on` | `true` | | Enable the resonant boom |
 | `res_hz` | `50.0` | 25..120 | Resonance centre frequency |
-| `res_db` | `6.0` | 0..18 | Resonance gain |
-| `res_q` | `2.0` | 0.5..10 | Resonance Q (higher is narrower) |
-| `drive_max` | `4.0` | 1..12 | Clipping drive |
+| `res_db` | `6.5` | 0..18 | Resonance gain |
+| `res_q` | `2.5` | 0.5..10 | Resonance Q (higher is narrower) |
+| `drive_max` | `8.0` | 1..12 | Clipping drive |
 | `bias_max` | `0.35` | 0..0.8 | Clipping asymmetry (adds even harmonics) |
 | `kick_on` | `true` | | Enable the extra kick-band saturation |
 | `kick_hz` | `130.0` | 60..300 | Kick band upper edge |
-| `kick_drive_max` | `2.2` | 1..6 | Kick-band drive |
+| `kick_drive_max` | `3.0` | 1..6 | Kick-band drive |
 | `crush_on` | `true` | | Enable the bit crusher |
 | `crush_bits_min` | `10.0` | 6..16 | Bit depth at 100 % |
 | `hold_on` | `true` | | Enable sample hold |
 | `hold_max` | `3.0` | 1..8 | Hold length at 100 % |
 | `lpf_on` | `true` | | Enable the treble low-pass |
-| `lpf_hz_start` | `14000.0` | 2000..20000 | Low-pass cutoff at low Intensity |
-| `lpf_hz_end` | `7500.0` | 2000..20000 | Low-pass cutoff at 100 % |
-| `lfo_on` | `false` | | Enable the rattle LFO (slow level wobble) |
-| `lfo_rate_hz` | `6.0` | 0.5..20 | LFO rate |
+| `lpf_hz_start` | `16000.0` | 2000..20000 | Low-pass cutoff at low Intensity |
+| `lpf_hz_end` | `10000.0` | 2000..20000 | Low-pass cutoff at 100 % |
+| `lfo_on` | `true` | | Enable the rattle LFO (slow level wobble) |
+| `lfo_rate_hz` | `5.0` | 0.5..20 | LFO rate |
 | `lfo_depth` | `0.3` | 0..1 | LFO depth (0 = no effect) |
 | `lfo_follow_bass` | `true` | | Scale the LFO by the bass envelope so it only wobbles on hits |
 | `lfo_target` | `"Gain"` | `"Gain"`, `"BassBand"`, `"Both"` | Modulate output gain, the kick band level, or both |
-| `out_trim_db` | `0.0` | -12..+6 | Output trim, added to the automatic loudness compensation |
+| `out_trim_db` | `1.1` | -12..+12 | Output trim, added to the automatic loudness compensation (the compensation is calibrated for the effect landing about 1 dB below dry with `auto_level` on, so 0 dB trim change keeps that). With `loudness_guard` on a positive trim can only lift the effect up to the input loudness (the guard still caps it there) |
+| `bass_boost_db` | `0.0` | 0..12 | Clean low-shelf gain on the effect output, after the distortion (0 = off). The GUI's **Bass boost** slider under Intensity; the wet signal is soft-limited while it is above 0 |
+| `bass_boost_hz` | `80.0` | 30..200 | Corner frequency of the Bass boost shelf (Advanced > Low end > Boost freq) |
+| `loudness_guard` | `false` | | Level guard (optional, off by default since Auto level): the effect is never louder than its input (plus `bass_boost_db`), see below. GUI: Advanced > Output > Level guard. A missing key means `false`; a saved `true` stays `true` |
+| `auto_level` | `true` | | Auto level: the effect follows the input loudness so the distortion amount and the output loudness do not depend on the input volume, see below. GUI: Advanced > Output > Auto level. A missing key means `true`. `false` = the legacy fixed-drive path (bit-identical to before Auto level, calibrated for about -18 dBFS RMS programme only) |
+| `mid_pass` | `0.15` | 0..1 | Mids/highs pass-through amount: that share of the processed signal above `mid_pass_hz` is replaced by the dry (original) signal. The default is low (15 %) so the clipper, ducker and lo-fi hit the whole signal and the bass takes over; high values (the earlier default was 0.9) keep mids/highs clean (1 kHz THD about -38 dB instead of about -20 dB). 0 = off (bit-identical to the old path; all presets except Default; a missing key). GUI: Advanced > Mids/highs |
+| `mid_pass_hz` | `400.0` | 100..1000 | Crossover frequency of the pass-through (4th-order Linkwitz-Riley pair, sums flat) |
+
+#### Auto level
+
+JBL Bass Mode is a saturating effect: a clipper, a kick-band saturator, a bass-keyed ducker and a bit crusher, all calibrated against fixed internal levels. Without compensation its loudness and character therefore depended on the input volume: the loudness was matched only for programme at about -18 dBFS RMS, so modern loud masters (-11 to -7 dBFS RMS) came out 8 to 12 dB **quieter** and flatter with the mode on, and quiet material came out several dB louder and grittier (measured through the full processor with the Default settings and intensity 90: +9.7 dB at -27, -1.1 dB at -17, -7.6 dB at -11, -11.6 dB at -7 and -12.9 dB at -3 dBFS RMS). **Auto level** (`auto_level`, on by default) makes the effect level-aware:
+
+1. A mean-square follower on the dry input (one scalar gain for both channels from L+R power, so the stereo image is preserved) tracks the programme level. It attacks with a 40 ms and releases with a 300 ms time constant (slow enough not to follow the bass cycles or pump), and catches up with a 25 ms time constant when the level really drops (more than 4 dB below a 40 ms follower), so a sudden volume cut is not followed by a long burst of under-driven output.
+2. The input of the wet path (shelf, resonance, kick saturation, clipper, bit crush, bass detector for the ducking) is scaled to a fixed reference level of -18 dBFS RMS, the level the clipper, ducker and lo-fi stages were calibrated at. The wet path therefore always sees the same drive, so the amount of distortion (THD), the grit, the per-kick pump depth and the bass boom are the same at every input volume.
+3. The same factor is undone on the wet output (after the lo-fi stages, before the pass-through and the clean Bass boost). The effect's loudness therefore follows the input loudness 1:1, and the Default lands about 1 dB below dry whatever the volume.
+4. The mids/highs pass-through (`mid_pass`) takes the true dry signal (it is never pre-gained), so its balance against the wet part is the same at every level.
+
+The gain is limited to +24 dB of boost (below about -42 dBFS RMS the gain stays at +24 dB, so silence and noise are never boosted without bound and silence stays silence) and 30 dB of cut. The follower keeps running while the effect is off, so switching it on mid-song starts at the right gain, and level changes are smooth (no zipper): after an 18 dB step the level has settled within about 300 to 500 ms (after a big cut the output is briefly, for about 100 to 250 ms, louder than the new level). The calibration is stored per `auto_level` setting, so with `auto_level = false` the signal path is bit-identical to the one before Auto level existed (loudness only right at about -18 dBFS RMS; the presets' `out_trim_db` values were re-trimmed for Auto level, so with it off they are a few dB off the old loudness; use the Trim slider). Measured with the Default and the presets (music-like test signals, guard off): about -1.0 dB versus dry (Default; -0.1 to -1.1 for the presets) at -30, -24, -18, -12, -6 and -3 dBFS RMS at 48 kHz; the 60 Hz THD (-9.7 dB), the 1 kHz THD (-18.6 dB) and the per-kick mid dip versus dry (-14.7 dB) are identical from -30 to -12 dBFS (and within 0.3 dB at -6).
+
+#### Level guard
+
+The optional **level guard** (`loudness_guard`, off by default since Auto level) keeps the effect from ever being louder than its input: per sample it follows the mean-square (RMS) level of the input and of the effect's wet signal with a 150 ms one-pole window and attenuates the wet signal by `min(1, sqrt(input / wet))` (with the mids/highs pass-through only the processed part is turned down; the pass-through is counted in the level but never attenuated by the guard). The gain falls with a 40 ms time constant and recovers over 300 ms, so it is smooth (no clicks or pumping of its own), only ever turns the effect down, and stays at unity for silence and signals below about -100 dBFS. With the guard on the effect is at most about 0 dB versus the input for every preset, at any input level and sample rate (with or without Auto level). Only the **Bass boost** slider raises the ceiling, by its dB amount; a positive **Trim** can bring a quiet preset up to, but not past, the input loudness. With Auto level on the effect already sits just under the input loudness, so the guard rarely acts; it is mainly a safety net for custom settings with a large positive Trim, and it is the tool to use with `auto_level = false` if quiet material is too loud. Switch the guard off (default) to hear the unrestrained effect.
+
+#### Presets
+
+The GUI's Fun section has a **Preset** drop-down that loads a ready-made sound: it sets `jbl_intensity` and the whole `[jbl]` table in one go. Presets are applied from the GUI only and are not stored as a name; the config just holds the resulting values. The drop-down shows the matching preset's name, or "Custom" once any value no longer equals a preset. Each preset's `out_trim_db` loudness-matches it to the default sound with Auto level on (within about 0.1 dB at -30 to -18 dBFS RMS, within 0.5 dB up to -6 dBFS, and the same holds at 44.1/48/96 kHz), so every preset lands within about 1 dB of dry at any volume (the Default about -1.0 dB, the others -0.1 to -1.1 dB). Several presets therefore carry a large positive trim (up to +10.2 dB for Pumper). All presets have the level guard off and Auto level on. The presets live in `eq_core::jbl_presets()`.
+
+| Preset | `jbl_intensity` | Sound |
+|---|---|---|
+| Default | 90 | The tuned "fun" sound described above: big bass, pumping, grit and a light rattle, with only a little of the dry mids/highs let through (15 %), so the bass takes over and distorts the whole sound |
+| Mild | 45 | Subtle warmth: gentle shelf, small resonance, light pump, no lo-fi or rattle |
+| Clean Boost | 80 | Bass lift only (shelf and boom): no pumping, distortion, lo-fi or rattle |
+| Club Sub | 85 | Heavy clean sub around 47 Hz, light slow pump, open treble |
+| Trunk Rattle | 85 | Fast 8 Hz rattle on every bass hit (gain and bass band) with some grit |
+| Pumper | 90 | Extreme sidechain wobble: maximum duck depth, 1.5 ms attack, 200 ms release |
+| Blown Speaker | 95 | Heavy clipping, 6.5-bit crush, 5x sample hold and a dull 4.5 kHz top |
 
 Example:
 
 ```toml
 jbl_bass_mode = true
-jbl_intensity = 80
+jbl_intensity = 90
 
 [jbl]
 shelf_hz = 60.0
-lfo_on = true
+lfo_rate_hz = 4.0
 lfo_target = "Both"
 ```
 

@@ -14,6 +14,7 @@ fn apply(p: &mut JblParams, kv: &str) {
         match k {
             "duck_on" => p.duck_on = b,
             "duck_depth" => p.duck_depth = f,
+            "duck_floor_db" => p.duck_floor_db = f,
             "duck_attack_ms" => p.duck_attack_ms = f,
             "duck_release_ms" => p.duck_release_ms = f,
             "detect_hz" => p.detect_hz = f,
@@ -47,6 +48,11 @@ fn apply(p: &mut JblParams, kv: &str) {
                 }
             }
             "out_trim_db" => p.out_trim_db = f,
+            "bass_boost_db" => p.bass_boost_db = f,
+            "loudness_guard" => p.loudness_guard = b,
+            "auto_level" => p.auto_level = b,
+            "mid_pass" => p.mid_pass = f,
+            "mid_pass_hz" => p.mid_pass_hz = f,
             _ => panic!("unknown key {k}"),
         }
     }
@@ -274,25 +280,41 @@ fn thd(fs: f64, f_target: f64, amp_db: f64, pct: u8, p: &JblParams) -> (f64, f64
     (10.0 * (harm / fund).log10(), 10.0 * ((total - fund) / fund).log10())
 }
 
-fn pump(fs: f64, pct: u8, p: &JblParams) -> (f64, f64, f64, f64) {
+fn pump(fs: f64, pct: u8, p: &JblParams) -> (f64, f64, f64, f64, f64, f64) {
+    pump_at(fs, pct, p, None)
+}
+/// `pump` with the kick+vocal signal rescaled to `rms_db` dBFS RMS (None = the harness default).
+fn pump_at(fs: f64, pct: u8, p: &JblParams, rms_db: Option<f64>) -> (f64, f64, f64, f64, f64, f64) {
     let n = (fs * 12.0) as usize;
     let x = sig_kick_vocal(n, fs);
+    let x = match rms_db {
+        Some(db) => rescale(&x, db),
+        None => x,
+    };
     let on = render(fs, &x, pct, p, true);
     let mut q = *p;
     q.duck_on = false;
     let off = render(fs, &x, pct, &q, true);
+    let dry = render(fs, &x, 0, p, false);
     let (mo, mf) = (bandpass(&on, fs, 300.0, 3000.0), bandpass(&off, fs, 300.0, 3000.0));
+    let md = bandpass(&dry, fs, 300.0, 3000.0);
     let win = (fs * 0.005) as usize;
     let beat = 60.0 / BPM;
-    let ratio_at = |t0: f64| -> f64 {
+    let ratio_vs = |den: &[f32], t0: f64| -> f64 {
         let s = (t0 * fs) as usize;
         let e = |v: &[f32]| (v[s..s + win].iter().map(|a| f64::from(*a).powi(2)).sum::<f64>() / win as f64).sqrt();
-        20.0 * ((e(&mo) + 1e-12) / (e(&mf) + 1e-12)).log10()
+        20.0 * ((e(&mo) + 1e-12) / (e(den) + 1e-12)).log10()
     };
+    let ratio_at = |t0: f64| -> f64 { ratio_vs(&mf, t0) };
     let (mut dips, mut tmins, mut recs, mut means) = (vec![], vec![], vec![], vec![]);
+    let (mut dips_d, mut means_d) = (vec![], vec![]);
     for kk in 3..20 {
         let t0 = kk as f64 * beat;
         let steps = (beat / 0.005) as usize - 2;
+        let rd: Vec<f64> = (0..steps).map(|i| ratio_vs(&md, t0 + i as f64 * 0.005)).collect();
+        let mean_d = rd.iter().sum::<f64>() / steps as f64;
+        dips_d.push(rd.iter().cloned().fold(1e9, f64::min) - mean_d);
+        means_d.push(mean_d);
         let rs: Vec<f64> = (0..steps).map(|i| ratio_at(t0 + i as f64 * 0.005)).collect();
         let (imin, vmin) = rs.iter().enumerate().fold((0, 1e9), |a, (i, v)| if *v < a.1 { (i, *v) } else { a });
         // recovery: first window after the min with ratio > -1 dB below the beat-average of last 100ms
@@ -304,7 +326,7 @@ fn pump(fs: f64, pct: u8, p: &JblParams) -> (f64, f64, f64, f64) {
         means.push(rs.iter().sum::<f64>() / steps as f64);
     }
     let m = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
-    (m(&dips), m(&tmins), m(&recs), m(&means))
+    (m(&dips), m(&tmins), m(&recs), m(&means), m(&dips_d), m(&means_d))
 }
 
 fn peak(x: &[f32]) -> f32 {
@@ -351,10 +373,137 @@ fn jbl_audit() {
             let (h60, n60) = thd(fs, 60.0, -12.0, pct, &p);
             let (h60q, _) = thd(fs, 60.0, -24.0, pct, &p);
             let (h1k, n1k) = thd(fs, 1000.0, -20.0, pct, &p);
-            let (dip, tmin, rec, mean) = pump(fs, pct, &p);
+            let (dip, tmin, rec, mean, dip_d, mean_d) = pump(fs, pct, &p);
             println!(
-                "FS{fs:.0} pct={pct:3} THD60Hz(-12dBFS)={h60:.1}dB THD+N={n60:.1} THD60(-24)={h60q:.1} | THD1k(-20)={h1k:.1}dB THD+N={n1k:.1} | PUMP dip={dip:.1}dB at {tmin:.0}ms recov(-1dB)={rec:.0}ms meanMidGain={mean:.1}dB"
+                "FS{fs:.0} pct={pct:3} THD60Hz(-12dBFS)={h60:.1}dB THD+N={n60:.1} THD60(-24)={h60q:.1} | THD1k(-20)={h1k:.1}dB THD+N={n1k:.1} | PUMP dip={dip:.1}dB at {tmin:.0}ms recov(-1dB)={rec:.0}ms meanMidGain={mean:.1}dB | VSDRY mid300-3k mean={mean_d:+.1}dB perKickDip={dip_d:.1}dB"
             );
+        }
+    }
+}
+
+/// Per-preset report: loudness vs dry (RMS, mean over the three signals at JBL_RMS, default -18 dBFS),
+/// peak, limiter-knee fraction at -14 dBFS RMS, THD and mid-band pump dip.
+/// Run: `cargo test -p eq-core --release --test jbl_audit jbl_presets_audit -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn jbl_presets_audit() {
+    let rates: Vec<f64> =
+        std::env::var("JBL_FS").unwrap_or("48000".into()).split(',').map(|s| s.parse().unwrap()).collect();
+    for pr in eq_core::jbl_presets() {
+        for &fs in &rates {
+            let n = (fs * 12.0) as usize;
+            let ref_sigs: [Vec<f64>; 3] = [sig_kick_sub(n, fs), sig_fullband(n, fs), sig_kick_vocal(n, fs)];
+            let mut ds = vec![];
+            let (mut pk, mut lim) = (0f32, 0f64);
+            for x in &ref_sigs {
+                let dry = render(fs, x, 0, &pr.params, false);
+                let wet = render(fs, x, pr.intensity, &pr.params, true);
+                let (d, w) = (&dry[(fs * 1.0) as usize..], &wet[(fs * 1.0) as usize..]);
+                ds.push(rms_db(w) - rms_db(d));
+                pk = pk.max(peak(w));
+                lim = lim.max(w.iter().filter(|v| v.abs() > 0.891_250_9).count() as f64 / w.len() as f64 * 100.0);
+            }
+            let mean = ds.iter().sum::<f64>() / 3.0;
+            let (h60, _) = thd(fs, 60.0, -12.0, pr.intensity, &pr.params);
+            let (dip, _, _, _, _, _) = pump(fs, pr.intensity, &pr.params);
+            println!(
+                "PRESET {:14} fs={fs:.0} int={} trim={:+.1} dRMS=[{:+.2} {:+.2} {:+.2}] mean={mean:+.2} peak={pk:.3} lim%={lim:.2} THD60={h60:.1}dB pumpdip={dip:.1}dB",
+                pr.name, pr.intensity, pr.params.out_trim_db, ds[0], ds[1], ds[2]
+            );
+        }
+    }
+}
+
+fn rescale(x: &[f64], rms_db: f64) -> Vec<f64> {
+    let r = (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64).sqrt();
+    let g = 10f64.powf(rms_db / 20.0) / r;
+    x.iter().map(|v| v * g).collect()
+}
+
+/// Loudness report: RMS(out)/RMS(in) in dB, per preset, per input level, mean over the three
+/// signals (worst signal in brackets), guard off, with auto level off then on (`off->on`). Env:
+/// JBL_FS (rates), JBL_LEVELS ("-30,-24,-18,-12,-6,-3").
+/// Run: `cargo test -p eq-core --release --test jbl_audit jbl_guard_audit -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn jbl_guard_audit() {
+    let rates: Vec<f64> =
+        std::env::var("JBL_FS").unwrap_or("48000".into()).split(',').map(|s| s.parse().unwrap()).collect();
+    let levels: Vec<f64> = std::env::var("JBL_LEVELS")
+        .unwrap_or("-30,-24,-18,-12,-6,-3".into())
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
+    for &fs in &rates {
+        let n = (fs * 12.0) as usize;
+        let base: [Vec<f64>; 3] = [sig_kick_sub(n, fs), sig_fullband(n, fs), sig_kick_vocal(n, fs)];
+        let skip = fs as usize;
+        for pr in eq_core::jbl_presets() {
+            let mut line = format!("GUARD fs={fs:.0} {:13}", pr.name);
+            for &lv in &levels {
+                let mut cell = String::new();
+                for auto in [false, true] {
+                    let p = JblParams { loudness_guard: false, auto_level: auto, ..pr.params };
+                    let (mut sum, mut worst) = (0.0, -99.0f64);
+                    for b in &base {
+                        let x = rescale(b, lv);
+                        let w = render(fs, &x, pr.intensity, &p, true);
+                        let xi: Vec<f32> = x.iter().map(|v| *v as f32).collect();
+                        let d = rms_db(&w[skip..]) - rms_db(&xi[skip..]);
+                        sum += d;
+                        worst = worst.max(d);
+                    }
+                    cell += &format!(" {:+.2}({:+.2})", sum / 3.0, worst);
+                    if !auto {
+                        cell += "->";
+                    }
+                }
+                line += &format!(" | {lv:.0}:{cell}");
+            }
+            println!("{line}");
+        }
+    }
+}
+
+/// Level-independence report (auto level on vs off): per input level (dBFS RMS), THD of a 60 Hz and
+/// a 1 kHz tone (tone RMS = level), the per-kick dip of the 300-3k mid band vs dry on the kick+vocal
+/// signal, and its peak. Default params unless JBL_SET; JBL_INT intensity (default 90); JBL_FS rates;
+/// JBL_LEVELS ("-30,-24,-18,-12,-6").
+/// Run: `cargo test -p eq-core --release --test jbl_audit jbl_level_audit -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn jbl_level_audit() {
+    let mut p = JblParams::default();
+    if let Ok(s) = std::env::var("JBL_SET") {
+        apply(&mut p, &s);
+    }
+    let pct: u8 = std::env::var("JBL_INT").ok().and_then(|s| s.parse().ok()).unwrap_or(90);
+    let rates: Vec<f64> =
+        std::env::var("JBL_FS").unwrap_or("48000".into()).split(',').map(|s| s.parse().unwrap()).collect();
+    let levels: Vec<f64> = std::env::var("JBL_LEVELS")
+        .unwrap_or("-30,-24,-18,-12,-6".into())
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
+    for &fs in &rates {
+        for auto in [false, true] {
+            let q = JblParams { auto_level: auto, loudness_guard: false, ..p };
+            for &lv in &levels {
+                let amp_db = lv + 3.01;
+                let (h60, _) = thd(fs, 60.0, amp_db, pct, &q);
+                let (h1k, _) = thd(fs, 1000.0, amp_db, pct, &q);
+                let (_, _, _, _, dip_d, mean_d) = pump_at(fs, pct, &q, Some(lv));
+                let n = (fs * 6.0) as usize;
+                let x = rescale(&sig_kick_vocal(n, fs), lv);
+                let w = render(fs, &x, pct, &q, true);
+                let knee = 0.891_250_9;
+                let lim = w.iter().filter(|v| v.abs() > knee).count() as f64 / w.len() as f64 * 100.0;
+                println!(
+                    "LEVELAUDIT fs={fs:.0} auto={} in={lv:+.0} THD60={h60:.1}dB THD1k={h1k:.1}dB kickdip={dip_d:.1}dB midvsdry={mean_d:+.1}dB peak={:.2} lim%={lim:.2}",
+                    u8::from(auto),
+                    peak(&w)
+                );
+            }
         }
     }
 }

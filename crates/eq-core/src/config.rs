@@ -230,8 +230,14 @@ pub enum JblLfoTarget {
 pub struct JblParams {
     // Pump / duck
     pub duck_on: bool,
-    /// Duck depth (0..=6, default 2.0).
+    /// Duck depth (0..=6, default 4.0).
     pub duck_depth: f32,
+    /// Ducking floor dB (-24..=0, default -9): the most the ducker may turn the level down on a bass
+    /// hit (the curve shape, attack and release are unchanged; the dip just stops at this level).
+    /// -24 = no floor (the plain curve, the original behaviour); 0 = no ducking. A saved `[jbl]`
+    /// table without the key loads as -24, so an older sound is unchanged.
+    #[serde(default = "no_duck_floor")]
+    pub duck_floor_db: f32,
     /// Duck attack ms (0.5..=50, default 5).
     pub duck_attack_ms: f32,
     /// Duck release ms (10..=800, default 120).
@@ -241,24 +247,24 @@ pub struct JblParams {
     // Low end
     /// Low-shelf frequency Hz (30..=200, default 70).
     pub shelf_hz: f32,
-    /// Low-shelf gain dB (0..=18, default 12).
+    /// Low-shelf gain dB (0..=18, default 10).
     pub shelf_db: f32,
     pub res_on: bool,
     /// Resonance frequency Hz (25..=120, default 50).
     pub res_hz: f32,
-    /// Resonance gain dB (0..=18, default 6).
+    /// Resonance gain dB (0..=18, default 6.5).
     pub res_db: f32,
     /// Resonance Q (0.5..=10, default 2).
     pub res_q: f32,
     // Distortion
-    /// Max drive (1..=12, default 4).
+    /// Max drive (1..=12, default 8).
     pub drive_max: f32,
     /// Max asymmetric bias (0..=0.8, default 0.35).
     pub bias_max: f32,
     pub kick_on: bool,
     /// Kick band frequency Hz (60..=300, default 130).
     pub kick_hz: f32,
-    /// Max kick drive (1..=6, default 2.2).
+    /// Max kick drive (1..=6, default 3).
     pub kick_drive_max: f32,
     // Lo-fi
     pub crush_on: bool,
@@ -268,9 +274,9 @@ pub struct JblParams {
     /// Max sample-hold factor (1..=8, default 3).
     pub hold_max: f32,
     pub lpf_on: bool,
-    /// LPF cutoff at 0 % Hz (2000..=20000, default 14000).
+    /// LPF cutoff at 0 % Hz (2000..=20000, default 16000).
     pub lpf_hz_start: f32,
-    /// LPF cutoff at 100 % Hz (2000..=20000, default 7500).
+    /// LPF cutoff at 100 % Hz (2000..=20000, default 10000).
     pub lpf_hz_end: f32,
     // Rattle LFO
     pub lfo_on: bool,
@@ -282,42 +288,74 @@ pub struct JblParams {
     pub lfo_follow_bass: bool,
     pub lfo_target: JblLfoTarget,
     // Output
-    /// Extra output trim dB (-12..=6, default 0).
+    /// Extra output trim dB (-12..=12, default 0; the Default sound uses 1.1).
     pub out_trim_db: f32,
+    /// Clean low-shelf boost dB on the effect's wet output, after the distortion (0..=12, default 0 = off).
+    pub bass_boost_db: f32,
+    /// Corner frequency Hz of the clean bass boost (30..=200, default 80).
+    pub bass_boost_hz: f32,
+    /// Level guard (default off): the effect's output is never allowed to be louder than its input
+    /// (plus `bass_boost_db`); it only ever turns the wet signal down. Off = unguarded. Auto level
+    /// already matches the loudness, so the guard is an optional extra safety net.
+    pub loudness_guard: bool,
+    /// Auto level (default on): the effect follows the input loudness, so the distortion amount and
+    /// the output loudness stay the same at any volume (see `docs/configuration.md`). A saved `[jbl]`
+    /// table without the key loads as on. Off = the legacy fixed-drive behaviour (calibrated for
+    /// about -18 dBFS RMS music only).
+    #[serde(default = "default_true")]
+    pub auto_level: bool,
+    // Mids/highs
+    /// Mids/highs pass-through (0..=1, default 0.15): how much of the DRY signal above `mid_pass_hz`
+    /// replaces the processed signal there. Small by default so the bass takes over and the clipper,
+    /// ducker and lo-fi act on the whole signal (0.9 kept the mids/highs clean: 1 kHz THD about
+    /// -38 dB instead of -20 dB). 0 = off (the whole signal is processed). A saved `[jbl]` table
+    /// that has no `mid_pass` key loads as 0, so an older customised sound is not changed behind the
+    /// user's back; the Default preset and `JblParams::default()` use 0.15.
+    #[serde(default = "zero_f32")]
+    pub mid_pass: f32,
+    /// Crossover frequency Hz of the mids/highs pass-through (100..=1000, default 400).
+    pub mid_pass_hz: f32,
 }
 
 impl Default for JblParams {
     fn default() -> Self {
         JblParams {
             duck_on: true,
-            duck_depth: 2.0,
+            duck_depth: 4.0,
+            duck_floor_db: -9.0,
             duck_attack_ms: 5.0,
             duck_release_ms: 120.0,
             detect_hz: 100.0,
             shelf_hz: 70.0,
-            shelf_db: 12.0,
+            shelf_db: 10.0,
             res_on: true,
             res_hz: 50.0,
-            res_db: 6.0,
-            res_q: 2.0,
-            drive_max: 4.0,
+            res_db: 6.5,
+            res_q: 2.5,
+            drive_max: 8.0,
             bias_max: 0.35,
             kick_on: true,
             kick_hz: 130.0,
-            kick_drive_max: 2.2,
+            kick_drive_max: 3.0,
             crush_on: true,
             crush_bits_min: 10.0,
             hold_on: true,
             hold_max: 3.0,
             lpf_on: true,
-            lpf_hz_start: 14000.0,
-            lpf_hz_end: 7500.0,
-            lfo_on: false,
-            lfo_rate_hz: 6.0,
+            lpf_hz_start: 16000.0,
+            lpf_hz_end: 10000.0,
+            lfo_on: true,
+            lfo_rate_hz: 5.0,
             lfo_depth: 0.3,
             lfo_follow_bass: true,
             lfo_target: JblLfoTarget::Gain,
-            out_trim_db: 0.0,
+            out_trim_db: 1.1,
+            bass_boost_db: 0.0,
+            bass_boost_hz: 80.0,
+            loudness_guard: false,
+            auto_level: true,
+            mid_pass: 0.15,
+            mid_pass_hz: 400.0,
         }
     }
 }
@@ -330,6 +368,7 @@ impl JblParams {
         let c = |v: f32, dv: f32, lo: f32, hi: f32| if v.is_finite() { v.clamp(lo, hi) } else { dv };
         JblParams {
             duck_depth: c(self.duck_depth, d.duck_depth, 0.0, 6.0),
+            duck_floor_db: c(self.duck_floor_db, d.duck_floor_db, DUCK_FLOOR_OFF_DB, 0.0),
             duck_attack_ms: c(self.duck_attack_ms, d.duck_attack_ms, 0.5, 50.0),
             duck_release_ms: c(self.duck_release_ms, d.duck_release_ms, 10.0, 800.0),
             detect_hz: c(self.detect_hz, d.detect_hz, 40.0, 250.0),
@@ -348,14 +387,255 @@ impl JblParams {
             lpf_hz_end: c(self.lpf_hz_end, d.lpf_hz_end, 2000.0, 20000.0),
             lfo_rate_hz: c(self.lfo_rate_hz, d.lfo_rate_hz, 0.5, 20.0),
             lfo_depth: c(self.lfo_depth, d.lfo_depth, 0.0, 1.0),
-            out_trim_db: c(self.out_trim_db, d.out_trim_db, -12.0, 6.0),
+            out_trim_db: c(self.out_trim_db, d.out_trim_db, -12.0, 12.0),
+            bass_boost_db: c(self.bass_boost_db, d.bass_boost_db, 0.0, 12.0),
+            bass_boost_hz: c(self.bass_boost_hz, d.bass_boost_hz, 30.0, 200.0),
+            mid_pass: c(self.mid_pass, d.mid_pass, 0.0, 1.0),
+            mid_pass_hz: c(self.mid_pass_hz, d.mid_pass_hz, 100.0, 1000.0),
             ..self
         }
     }
 }
 
+/// `duck_floor_db` value that disables the floor.
+pub const DUCK_FLOOR_OFF_DB: f32 = -24.0;
+
+fn no_duck_floor() -> f32 {
+    DUCK_FLOOR_OFF_DB
+}
+
+fn zero_f32() -> f32 {
+    0.0
+}
+
 fn default_jbl_intensity() -> u8 {
-    80
+    90
+}
+
+/// A named JBL Bass Mode sound: an Intensity plus a full [`JblParams`] set. Presets are only
+/// applied from the GUI (values are copied into the config); no preset name is ever stored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JblPreset {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub intensity: u8,
+    pub params: JblParams,
+}
+
+impl JblPreset {
+    /// True if `intensity` and `params` equal this preset (floats within a tiny epsilon).
+    pub fn matches(&self, intensity: u8, params: &JblParams) -> bool {
+        const EPS: f32 = 1e-4;
+        let (a, b) = (&self.params, params);
+        let f = |x: f32, y: f32| (x - y).abs() <= EPS;
+        self.intensity == intensity
+            && a.duck_on == b.duck_on
+            && f(a.duck_depth, b.duck_depth)
+            && f(a.duck_floor_db, b.duck_floor_db)
+            && f(a.duck_attack_ms, b.duck_attack_ms)
+            && f(a.duck_release_ms, b.duck_release_ms)
+            && f(a.detect_hz, b.detect_hz)
+            && f(a.shelf_hz, b.shelf_hz)
+            && f(a.shelf_db, b.shelf_db)
+            && a.res_on == b.res_on
+            && f(a.res_hz, b.res_hz)
+            && f(a.res_db, b.res_db)
+            && f(a.res_q, b.res_q)
+            && f(a.drive_max, b.drive_max)
+            && f(a.bias_max, b.bias_max)
+            && a.kick_on == b.kick_on
+            && f(a.kick_hz, b.kick_hz)
+            && f(a.kick_drive_max, b.kick_drive_max)
+            && a.crush_on == b.crush_on
+            && f(a.crush_bits_min, b.crush_bits_min)
+            && a.hold_on == b.hold_on
+            && f(a.hold_max, b.hold_max)
+            && a.lpf_on == b.lpf_on
+            && f(a.lpf_hz_start, b.lpf_hz_start)
+            && f(a.lpf_hz_end, b.lpf_hz_end)
+            && a.lfo_on == b.lfo_on
+            && f(a.lfo_rate_hz, b.lfo_rate_hz)
+            && f(a.lfo_depth, b.lfo_depth)
+            && a.lfo_follow_bass == b.lfo_follow_bass
+            && a.lfo_target == b.lfo_target
+            && f(a.out_trim_db, b.out_trim_db)
+            && f(a.bass_boost_db, b.bass_boost_db)
+            && f(a.bass_boost_hz, b.bass_boost_hz)
+            && a.loudness_guard == b.loudness_guard
+            && a.auto_level == b.auto_level
+            && f(a.mid_pass, b.mid_pass)
+            && f(a.mid_pass_hz, b.mid_pass_hz)
+    }
+}
+
+/// The built-in JBL Bass Mode presets, "Default" first. Each `out_trim_db` loudness-matches the
+/// preset to the default sound (see `jbl_presets_loudness_matched` in `dsp.rs`).
+pub fn jbl_presets() -> &'static [JblPreset] {
+    static PRESETS: std::sync::OnceLock<Vec<JblPreset>> = std::sync::OnceLock::new();
+    PRESETS.get_or_init(|| {
+        let d = JblParams::default();
+        // The other presets keep the pre-"lift mids/highs" values of the fields the Default retune changed,
+        // so only the Default sound moves (their loudness is re-trimmed via `out_trim_db`).
+        let legacy = JblParams {
+            duck_depth: 4.5,
+            duck_release_ms: 150.0,
+            shelf_db: 14.0,
+            res_db: 9.0,
+            drive_max: 5.5,
+            kick_drive_max: 3.0,
+            lpf_hz_start: 14000.0,
+            lpf_hz_end: 7500.0,
+            mid_pass: 0.0,
+            duck_floor_db: DUCK_FLOOR_OFF_DB,
+            ..d
+        };
+        vec![
+            JblPreset {
+                name: "Default",
+                description: "The tuned \"fun\" sound: big bass, pumping, grit and a light rattle.",
+                intensity: default_jbl_intensity(),
+                params: d,
+            },
+            JblPreset {
+                name: "Mild",
+                description: "Subtle warmth: a gentle bass lift and a light pump, no grit.",
+                intensity: 45,
+                params: JblParams {
+                    duck_depth: 1.0,
+                    duck_attack_ms: 8.0,
+                    duck_release_ms: 140.0,
+                    shelf_hz: 80.0,
+                    shelf_db: 6.0,
+                    res_hz: 55.0,
+                    res_db: 3.0,
+                    res_q: 1.5,
+                    drive_max: 1.5,
+                    bias_max: 0.1,
+                    kick_on: false,
+                    crush_on: false,
+                    hold_on: false,
+                    lpf_on: false,
+                    lfo_on: false,
+                    out_trim_db: 8.1,
+                    ..legacy
+                },
+            },
+            JblPreset {
+                name: "Clean Boost",
+                description: "Bass lift only: shelf and boom, no distortion, pumping or lo-fi.",
+                intensity: 80,
+                params: JblParams {
+                    duck_on: false,
+                    shelf_hz: 70.0,
+                    shelf_db: 10.0,
+                    res_hz: 50.0,
+                    res_db: 6.0,
+                    res_q: 2.0,
+                    drive_max: 1.0,
+                    bias_max: 0.0,
+                    kick_on: false,
+                    crush_on: false,
+                    hold_on: false,
+                    lpf_on: false,
+                    lfo_on: false,
+                    out_trim_db: 5.5,
+                    ..legacy
+                },
+            },
+            JblPreset {
+                name: "Club Sub",
+                description: "Heavy clean sub around 47 Hz with a slow, light pump and an open top end.",
+                intensity: 85,
+                params: JblParams {
+                    duck_depth: 1.5,
+                    duck_attack_ms: 8.0,
+                    duck_release_ms: 220.0,
+                    shelf_hz: 60.0,
+                    shelf_db: 15.0,
+                    res_hz: 47.0,
+                    res_db: 12.0,
+                    res_q: 2.0,
+                    drive_max: 2.5,
+                    bias_max: 0.1,
+                    kick_hz: 110.0,
+                    kick_drive_max: 1.8,
+                    crush_on: false,
+                    hold_on: false,
+                    lpf_on: false,
+                    lfo_on: false,
+                    out_trim_db: 2.8,
+                    ..legacy
+                },
+            },
+            JblPreset {
+                name: "Trunk Rattle",
+                description: "Loose-panel rattle: a fast wobble on every bass hit, with some grit.",
+                intensity: 85,
+                params: JblParams {
+                    duck_depth: 3.0,
+                    duck_release_ms: 130.0,
+                    drive_max: 4.0,
+                    bias_max: 0.3,
+                    kick_drive_max: 2.5,
+                    crush_bits_min: 11.0,
+                    hold_max: 2.0,
+                    lpf_hz_end: 9000.0,
+                    lfo_on: true,
+                    lfo_rate_hz: 8.0,
+                    lfo_depth: 0.5,
+                    lfo_follow_bass: true,
+                    lfo_target: JblLfoTarget::Both,
+                    out_trim_db: 5.7,
+                    ..legacy
+                },
+            },
+            JblPreset {
+                name: "Pumper",
+                description: "Extreme sidechain wobble: the whole mix ducks hard on every kick.",
+                intensity: 90,
+                params: JblParams {
+                    duck_depth: 6.0,
+                    duck_attack_ms: 1.5,
+                    duck_release_ms: 200.0,
+                    shelf_db: 14.0,
+                    res_db: 9.0,
+                    res_q: 2.5,
+                    drive_max: 3.0,
+                    bias_max: 0.2,
+                    kick_drive_max: 2.0,
+                    crush_on: false,
+                    hold_on: false,
+                    lpf_hz_start: 16000.0,
+                    lpf_hz_end: 12000.0,
+                    lfo_on: false,
+                    out_trim_db: 10.2,
+                    ..legacy
+                },
+            },
+            JblPreset {
+                name: "Blown Speaker",
+                description: "Torn-cone destruction: heavy clipping, bit-crush, sample-hold and a dull top.",
+                intensity: 95,
+                params: JblParams {
+                    duck_depth: 2.5,
+                    duck_release_ms: 120.0,
+                    shelf_db: 12.0,
+                    res_db: 8.0,
+                    res_q: 2.0,
+                    drive_max: 10.0,
+                    bias_max: 0.6,
+                    kick_drive_max: 5.0,
+                    crush_bits_min: 6.5,
+                    hold_max: 5.0,
+                    lpf_hz_start: 8000.0,
+                    lpf_hz_end: 4500.0,
+                    lfo_on: false,
+                    out_trim_db: 4.3,
+                    ..legacy
+                },
+            },
+        ]
+    })
 }
 
 impl Default for Config {
@@ -603,6 +883,183 @@ mod tests {
         assert!(text.contains("[jbl]"));
         let back = Config::from_toml_str(&text).unwrap();
         assert_eq!(back.jbl, c.jbl);
+    }
+
+    #[test]
+    fn jbl_presets_are_valid_and_unique() {
+        let presets = jbl_presets();
+        assert!(presets.len() >= 7);
+        let mut names = std::collections::BTreeSet::new();
+        for p in presets {
+            assert!(!p.name.trim().is_empty() && !p.description.trim().is_empty());
+            assert!(names.insert(p.name), "duplicate preset name {}", p.name);
+            assert!(p.intensity <= 100, "{}", p.name);
+            assert_eq!(p.params, p.params.sanitized(), "{} has out-of-range values", p.name);
+        }
+        assert_eq!(presets[0].name, "Default");
+    }
+
+    #[test]
+    fn jbl_default_preset_matches_config_default_and_matches_is_strict() {
+        let c = Config::default();
+        let presets = jbl_presets();
+        assert!(presets[0].matches(c.jbl_intensity, &c.jbl));
+        // only the default config matches "Default"; every other preset differs from it
+        for p in &presets[1..] {
+            assert!(!p.matches(c.jbl_intensity, &c.jbl), "{} equals the default", p.name);
+            assert!(p.matches(p.intensity, &p.params));
+        }
+        let mut q = c.jbl;
+        q.duck_depth += 0.01;
+        assert!(!presets[0].matches(c.jbl_intensity, &q));
+        let mut q = c.jbl;
+        q.lfo_target = JblLfoTarget::Both;
+        assert!(!presets[0].matches(c.jbl_intensity, &q));
+        let mut q = c.jbl;
+        q.crush_on = !q.crush_on;
+        assert!(!presets[0].matches(c.jbl_intensity, &q));
+        assert!(!presets[0].matches(c.jbl_intensity - 1, &c.jbl));
+        // a TOML round trip keeps the match
+        let back = Config::from_toml_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert!(presets[0].matches(back.jbl_intensity, &back.jbl));
+    }
+
+    #[test]
+    fn jbl_loudness_guard_default_roundtrip_and_matching() {
+        // Configs without the key get the guard off (it is now opt-in); an explicit true is kept.
+        let c = Config::from_toml_str("[jbl]
+duck_depth = 4.0
+").unwrap();
+        assert!(!c.jbl.loudness_guard);
+        let c = Config::from_toml_str("[jbl]
+loudness_guard = true
+").unwrap();
+        assert!(c.jbl.loudness_guard);
+        assert!(!JblParams::default().loudness_guard);
+        let mut c = Config::default();
+        c.jbl.loudness_guard = true;
+        let back = Config::from_toml_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert!(back.jbl.loudness_guard);
+        assert!(back.sanitized().jbl.loudness_guard);
+        // Every preset has the guard off, and flipping it makes the preset stop matching.
+        for pr in jbl_presets() {
+            assert!(!pr.params.loudness_guard, "{}", pr.name);
+            let on = JblParams { loudness_guard: true, ..pr.params };
+            assert!(!pr.matches(pr.intensity, &on), "{}", pr.name);
+        }
+    }
+
+    #[test]
+    fn jbl_auto_level_default_roundtrip_and_matching() {
+        // Missing key = on; an explicit false is kept through a round trip and sanitizing.
+        let c = Config::from_toml_str("[jbl]
+duck_depth = 4.0
+").unwrap();
+        assert!(c.jbl.auto_level);
+        let c = Config::from_toml_str("[jbl]
+auto_level = false
+").unwrap();
+        assert!(!c.jbl.auto_level);
+        assert!(JblParams::default().auto_level);
+        let mut c = Config::default();
+        c.jbl.auto_level = false;
+        let back = Config::from_toml_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert!(!back.jbl.auto_level);
+        assert!(!back.sanitized().jbl.auto_level);
+        for pr in jbl_presets() {
+            assert!(pr.params.auto_level, "{}", pr.name);
+            let off = JblParams { auto_level: false, ..pr.params };
+            assert!(!pr.matches(pr.intensity, &off), "{}", pr.name);
+        }
+    }
+
+    #[test]
+    fn jbl_bass_boost_defaults_roundtrip_and_clamps() {
+        let c = Config::from_toml_str("[jbl]
+duck_depth = 4.0
+").unwrap();
+        assert_eq!(c.jbl.bass_boost_db, 0.0);
+        assert_eq!(c.jbl.bass_boost_hz, 80.0);
+        let mut c = Config::default();
+        c.jbl.bass_boost_db = 7.5;
+        c.jbl.bass_boost_hz = 120.0;
+        let back = Config::from_toml_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back.jbl.bass_boost_db, 7.5);
+        assert_eq!(back.jbl.bass_boost_hz, 120.0);
+        let hi = JblParams { bass_boost_db: 99.0, bass_boost_hz: 1.0, ..JblParams::default() }.sanitized();
+        assert_eq!((hi.bass_boost_db, hi.bass_boost_hz), (12.0, 30.0));
+        let lo = JblParams { bass_boost_db: -3.0, bass_boost_hz: 1e6, ..JblParams::default() }.sanitized();
+        assert_eq!((lo.bass_boost_db, lo.bass_boost_hz), (0.0, 200.0));
+        let nan = JblParams { bass_boost_db: f32::NAN, bass_boost_hz: f32::INFINITY, ..JblParams::default() }.sanitized();
+        assert_eq!((nan.bass_boost_db, nan.bass_boost_hz), (0.0, 80.0));
+        let p = JblParams { bass_boost_db: 3.0, ..JblParams::default() };
+        assert!(jbl_presets().iter().all(|pr| !pr.matches(pr.intensity, &p)));
+        assert!(jbl_presets().iter().all(|pr| pr.params.bass_boost_db == 0.0));
+    }
+
+    #[test]
+    fn jbl_mid_pass_defaults_roundtrip_clamps_and_matching() {
+        let d = JblParams::default();
+        assert_eq!((d.mid_pass, d.mid_pass_hz), (0.15, 400.0));
+        // Only the Default preset uses the pass-through; the others keep their old sound.
+        let presets = jbl_presets();
+        assert_eq!(presets[0].params.mid_pass, 0.15);
+        assert!(presets[1..].iter().all(|p| p.params.mid_pass == 0.0), "other presets stay without pass-through");
+        // A saved [jbl] table without the key keeps its old sound (mid_pass 0); the hz key defaults.
+        let c = Config::from_toml_str("[jbl]
+duck_depth = 4.0
+").unwrap();
+        assert_eq!((c.jbl.mid_pass, c.jbl.mid_pass_hz), (0.0, 400.0));
+        let c = Config::from_toml_str("[jbl]
+mid_pass = 0.5
+mid_pass_hz = 250.0
+").unwrap();
+        assert_eq!((c.jbl.mid_pass, c.jbl.mid_pass_hz), (0.5, 250.0));
+        // No [jbl] table at all: the full default.
+        assert_eq!(Config::from_toml_str("jbl_intensity = 50
+").unwrap().jbl.mid_pass, 0.15);
+        let mut c = Config::default();
+        c.jbl.mid_pass = 0.35;
+        c.jbl.mid_pass_hz = 640.0;
+        let back = Config::from_toml_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!((back.jbl.mid_pass, back.jbl.mid_pass_hz), (0.35, 640.0));
+        // Clamps and NaN.
+        let hi = JblParams { mid_pass: 9.0, mid_pass_hz: 1.0, ..d }.sanitized();
+        assert_eq!((hi.mid_pass, hi.mid_pass_hz), (1.0, 100.0));
+        let lo = JblParams { mid_pass: -1.0, mid_pass_hz: 1e9, ..d }.sanitized();
+        assert_eq!((lo.mid_pass, lo.mid_pass_hz), (0.0, 1000.0));
+        let nan = JblParams { mid_pass: f32::NAN, mid_pass_hz: f32::INFINITY, ..d }.sanitized();
+        assert_eq!((nan.mid_pass, nan.mid_pass_hz), (d.mid_pass, d.mid_pass_hz));
+        // matches() notices both fields.
+        let c = Config::default();
+        assert!(!presets[0].matches(c.jbl_intensity, &JblParams { mid_pass: 0.5, ..c.jbl }));
+        assert!(!presets[0].matches(c.jbl_intensity, &JblParams { mid_pass_hz: 500.0, ..c.jbl }));
+        assert!(!presets[1].matches(presets[1].intensity, &JblParams { mid_pass: 0.1, ..presets[1].params }));
+    }
+
+    #[test]
+    fn jbl_duck_floor_defaults_roundtrip_clamps_and_matching() {
+        let d = JblParams::default();
+        assert_eq!((d.duck_depth, d.duck_attack_ms, d.duck_release_ms, d.duck_floor_db), (4.0, 5.0, 120.0, -9.0));
+        let presets = jbl_presets();
+        assert_eq!(presets[0].params.duck_floor_db, -9.0);
+        assert!(presets[1..].iter().all(|p| p.params.duck_floor_db == DUCK_FLOOR_OFF_DB), "others keep the plain curve");
+        // Old [jbl] tables keep their plain ducking curve.
+        let c = Config::from_toml_str("[jbl]
+duck_depth = 4.0
+").unwrap();
+        assert_eq!(c.jbl.duck_floor_db, DUCK_FLOOR_OFF_DB);
+        assert_eq!(Config::from_toml_str("jbl_intensity = 50
+").unwrap().jbl.duck_floor_db, -9.0);
+        let mut c = Config::default();
+        c.jbl.duck_floor_db = -4.5;
+        let back = Config::from_toml_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back.jbl.duck_floor_db, -4.5);
+        assert_eq!(JblParams { duck_floor_db: -99.0, ..d }.sanitized().duck_floor_db, DUCK_FLOOR_OFF_DB);
+        assert_eq!(JblParams { duck_floor_db: 3.0, ..d }.sanitized().duck_floor_db, 0.0);
+        assert_eq!(JblParams { duck_floor_db: f32::NAN, ..d }.sanitized().duck_floor_db, -9.0);
+        assert!(!presets[0].matches(Config::default().jbl_intensity, &JblParams { duck_floor_db: -8.0, ..d }));
+        assert!(!presets[1].matches(presets[1].intensity, &JblParams { duck_floor_db: -20.0, ..presets[1].params }));
     }
 
     #[test]

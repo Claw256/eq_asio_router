@@ -659,6 +659,85 @@ mod tests {
         assert_eq!(l[255], 100.0);
     }
 
+    /// Music-like test signal (128 BPM kick, sub-bass line, chord, noisy hats), mastered to `rms_db`
+    /// dBFS RMS with a gentle `tanh` ceiling at 0.98 so hot levels stay below full scale.
+    fn music(n: usize, fs: f64, rms_db: f64, seed: u64) -> Vec<f32> {
+        use std::f64::consts::PI;
+        let beat = 60.0 / 128.0;
+        let mut s = seed;
+        let mut noise = move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        let notes = [55.0, 55.0, 65.41, 49.0];
+        let raw: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                let tk = t % beat;
+                let kick = (-tk * 9.0).exp() * (2.0 * PI * (48.0 * tk + 90.0 * (1.0 - (-tk * 40.0).exp()) / 40.0)).sin();
+                let note = notes[((t / (beat * 4.0)) as usize) % 4];
+                let sub = 0.5 * (2.0 * PI * note * t).sin() * (0.6 + 0.4 * (2.0 * PI * t / beat).sin().abs());
+                let hat = 0.1 * noise() * (-((t + beat / 2.0) % beat) * 60.0).exp();
+                let chord: f64 = [220.0, 261.63, 329.63]
+                    .iter()
+                    .map(|f| (1..=6).map(|h| (2.0 * PI * f * f64::from(h) * t).sin() / f64::from(h)).sum::<f64>())
+                    .sum();
+                0.9 * kick + sub + hat + 0.12 * chord
+            })
+            .collect();
+        let clip = |v: f64, g: f64| 0.98 * (v * g / 0.98).tanh();
+        let target = 10f64.powf(rms_db / 20.0);
+        let (mut lo, mut hi) = (1e-3f64, 1e3f64);
+        for _ in 0..50 {
+            let g = (lo * hi).sqrt();
+            let r = (raw.iter().map(|v| clip(*v, g).powi(2)).sum::<f64>() / n as f64).sqrt();
+            if r < target {
+                lo = g;
+            } else {
+                hi = g;
+            }
+        }
+        let g = (lo * hi).sqrt();
+        raw.iter().map(|v| clip(*v, g) as f32).collect()
+    }
+
+    /// Output RMS (dBFS, last 2/3) of the full processor on `x` in 256-frame blocks.
+    fn processor_rms_db(c: &Config, fs: f64, x: &[f32]) -> f64 {
+        let mut p = EqProcessor::new(fs, c, 2, Arc::new(Handoff::new()));
+        let mut out = Vec::with_capacity(x.len());
+        for ch in x.chunks(256) {
+            let (mut l, mut r) = (ch.to_vec(), ch.to_vec());
+            p.process(&mut l, &mut r, BlockStats::default());
+            out.extend_from_slice(&l);
+        }
+        let seg = &out[out.len() / 3..];
+        assert!(seg.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+        20.0 * rms(seg).log10()
+    }
+
+    /// Regression for "JBL Bass Mode gets quieter the louder the music is": through the full
+    /// `EqProcessor` with the user's settings (Default JBL params, intensity 90), JBL on must stay
+    /// within 3 dB of JBL off at every input level from -30 to -3 dBFS RMS. The legacy fixed-drive
+    /// behaviour (auto level off) loses more than 6 dB at -6 dBFS.
+    #[test]
+    fn jbl_bass_mode_loudness_follows_input_level() {
+        let fs = 48000.0;
+        let n = (fs * 4.0) as usize;
+        let base = Config { jbl_bass_mode: false, auto_headroom: false, ..Config::default() };
+        let on = Config { jbl_bass_mode: true, ..base.clone() };
+        let legacy = Config { jbl: JblParams { auto_level: false, ..on.jbl }, ..on.clone() };
+        assert_eq!(on.jbl_intensity, 90);
+        for lv in [-30.0, -24.0, -18.0, -12.0, -6.0, -3.0] {
+            let x = music(n, fs, lv, 7);
+            let (off_db, on_db) = (processor_rms_db(&base, fs, &x), processor_rms_db(&on, fs, &x));
+            println!("JBL on-off at {lv} dBFS: {:+.2} dB", on_db - off_db);
+            assert!((on_db - off_db).abs() <= 3.0, "at {lv} dBFS JBL is {:+.2} dB vs off", on_db - off_db);
+        }
+        let x = music(n, fs, -6.0, 7);
+        let diff = processor_rms_db(&legacy, fs, &x) - processor_rms_db(&base, fs, &x);
+        assert!(diff < -6.0, "legacy fixed-drive path at -6 dBFS: {diff:+.2} dB");
+    }
+
     #[test]
     fn limiter_bounds_output() {
         let mut c = cfg(EqProfile::default());
