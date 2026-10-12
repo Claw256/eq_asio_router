@@ -19,9 +19,6 @@
 //!   `GetCurrentThreadId` compare per callback, no allocation, no syscall beyond that). The task handle
 //!   is remembered but never reverted from the audio thread: reverting there could race with the
 //!   driver tearing the thread down, and the registration vanishes with the thread anyway.
-//! * The capture thread registers itself in `wasapi-capture` (`session.rs`); its
-//!   `AvSetMmThreadPriority(CRITICAL)` result is published in
-//!   [`wasapi_capture::session::MMCSS_CAPTURE_PRIORITY`].
 //!
 //! [`HardeningReport`] says which of these succeeded (shown in the GUI status panel and the CLI header).
 
@@ -70,8 +67,6 @@ pub struct HardeningReport {
     pub timer_res: Option<bool>,
     /// MMCSS "Pro Audio" on the engine control thread.
     pub mmcss_control: Option<bool>,
-    /// MMCSS "Pro Audio" + CRITICAL on the WASAPI capture thread.
-    pub mmcss_capture: Option<bool>,
     /// MMCSS "Pro Audio" + CRITICAL on the driver-owned ASIO callback thread.
     pub mmcss_asio: Option<bool>,
 }
@@ -85,24 +80,22 @@ impl HardeningReport {
             priority_class: tri(PRIO_CLASS.load(Relaxed)),
             timer_res: tri(TIMER.load(Relaxed)),
             mmcss_control: tri(MMCSS_CONTROL.load(Relaxed)),
-            mmcss_capture: tri(wasapi_capture::session::MMCSS_CAPTURE_PRIORITY.load(Relaxed)),
             mmcss_asio: tri(asio),
         }
     }
 
     /// `(label, state)` rows for the UIs.
-    pub fn rows(&self) -> [(&'static str, Option<bool>); 6] {
+    pub fn rows(&self) -> [(&'static str, Option<bool>); 5] {
         [
             ("EcoQoS opt-out", self.ecoqos_optout),
             ("Priority class", self.priority_class),
             ("1 ms timer", self.timer_res),
             ("MMCSS control", self.mmcss_control),
-            ("MMCSS capture", self.mmcss_capture),
             ("MMCSS ASIO", self.mmcss_asio),
         ]
     }
 
-    /// Compact one-line text, e.g. `ecoqos ok, prio ok, timer ok, mmcss ctl ok/cap ok/asio ok`.
+    /// Compact one-line text, e.g. `ecoqos ok, prio ok, timer ok, mmcss ctl ok/asio ok`.
     pub fn summary(&self) -> String {
         let s = |v: Option<bool>| match v {
             Some(true) => "ok",
@@ -110,12 +103,11 @@ impl HardeningReport {
             None => "pending",
         };
         format!(
-            "ecoqos {}, prio {}, timer {}, mmcss ctl {}/cap {}/asio {}",
+            "ecoqos {}, prio {}, timer {}, mmcss ctl {}/asio {}",
             s(self.ecoqos_optout),
             s(self.priority_class),
             s(self.timer_res),
             s(self.mmcss_control),
-            s(self.mmcss_capture),
             s(self.mmcss_asio)
         )
     }
@@ -296,9 +288,9 @@ mod tests {
     #[test]
     fn report_text_and_rows() {
         let r = HardeningReport { ecoqos_optout: Some(true), mmcss_asio: Some(false), ..Default::default() };
-        assert_eq!(r.summary(), "ecoqos ok, prio pending, timer pending, mmcss ctl pending/cap pending/asio FAILED");
+        assert_eq!(r.summary(), "ecoqos ok, prio pending, timer pending, mmcss ctl pending/asio FAILED");
         assert_eq!(r.rows()[0], ("EcoQoS opt-out", Some(true)));
-        assert_eq!(r.rows()[5], ("MMCSS ASIO", Some(false)));
+        assert_eq!(r.rows()[4], ("MMCSS ASIO", Some(false)));
         assert_eq!(tri(0), None);
         assert_eq!(tri(1), Some(true));
         assert_eq!(tri(2), Some(false));

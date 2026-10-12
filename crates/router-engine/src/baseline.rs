@@ -1,4 +1,4 @@
-//! Baseline measurement of the latency probe: level statistics of the capture and loopback streams while
+//! Baseline measurement of the latency probe: level statistics of the source (ring-A tap) and loopback streams while
 //! nothing is injected (diagnostics, `router-cli latency --baseline`) and the detection thresholds derived
 //! from them (`router-cli latency`).
 
@@ -321,7 +321,7 @@ impl Monitor {
 // Detection high-pass
 // ------------------------------------------------------------------------------------
 
-pub use wasapi_capture::band::{auto_highpass_hz, click_envelope, HighPass, ENV_WINDOW};
+pub use router_core::band::{auto_highpass_hz, click_envelope, HighPass, ENV_WINDOW};
 
 // ------------------------------------------------------------------------------------
 // Thresholds derived from the measured baseline
@@ -361,11 +361,11 @@ pub struct Thresholds {
     pub notes: Vec<String>,
 }
 
-const NAMES: [&str; 4] = ["capture L", "capture R", "loopback L (Yamaha input)", "loopback R (Yamaha input)"];
+const NAMES: [&str; 4] = ["source L", "source R", "loopback L (Yamaha input)", "loopback R (Yamaha input)"];
 
-/// Derives the detection thresholds from the baseline reports (`rep` = [cap L, cap R, lb L, lb R]).
+/// Derives the detection thresholds from the baseline reports (`rep` = [src L, src R, lb L, lb R]).
 ///
-/// * capture: `max(click - 20, floor + 12)`, never above `click - 6`;
+/// * source: `max(click - 20, floor + 12)`, never above `click - 6`;
 /// * loopback: `max(click + preamp - 25, floor + 12)`, never above `click + preamp - 6`; `floor` is the largest
 ///   deviation from the baseline mean (the detector removes that mean);
 /// * programme audio (capture peak above -60 dBFS or loopback deviation above -40 dBFS) aborts.
@@ -451,7 +451,7 @@ pub fn plan_thresholds_checked(
     let cap_thr = match cap_override {
         Some(t) => {
             if f64::from(t) < cap_floor + 6.0 {
-                notes.push(format!("note: --cap-threshold-db {t:.1} is within 6 dB of the capture noise floor {cap_floor:.1} dBFS"));
+                notes.push(format!("note: --cap-threshold-db {t:.1} is within 6 dB of the source noise floor {cap_floor:.1} dBFS"));
             }
             f64::from(t)
         }
@@ -459,7 +459,7 @@ pub fn plan_thresholds_checked(
     };
     if cap_thr > click - CLICK_HEADROOM_DB {
         return Err(format!(
-            "capture noise floor {cap_floor:.1} dBFS is too high to detect a {click:.0} dBFS click: threshold {cap_thr:.1} dBFS would exceed click - {CLICK_HEADROOM_DB:.0} dB ({:.1} dBFS)",
+            "source noise floor {cap_floor:.1} dBFS is too high to detect a {click:.0} dBFS click: threshold {cap_thr:.1} dBFS would exceed click - {CLICK_HEADROOM_DB:.0} dB ({:.1} dBFS)",
             click - CLICK_HEADROOM_DB
         ));
     }

@@ -84,19 +84,3 @@ pub fn process_names() -> Vec<String> {
 pub fn bridge_running() -> bool {
     logic::bridge_in(process_names())
 }
-
-/// Opens Windows' Sound settings page (`ms-settings:sound`) with the default handler. Only
-/// called on a user click; no elevation, nothing is changed.
-pub fn open_sound_settings() -> Result<(), String> {
-    use windows::core::w;
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    // SAFETY: all strings are static NUL-terminated wide literals.
-    let h = unsafe { ShellExecuteW(None, w!("open"), w!("ms-settings:sound"), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
-    let code = h.0 as isize;
-    if code > 32 {
-        Ok(())
-    } else {
-        Err(format!("Could not open Windows Sound settings (code {code})"))
-    }
-}

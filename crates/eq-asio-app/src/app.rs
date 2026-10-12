@@ -41,8 +41,6 @@ pub struct App {
     learn_seen: u32,
     pub devices: Vec<String>,
     pub device_error: Option<String>,
-    pub captures: Vec<String>,
-    pub capture_list_error: Option<String>,
     pub response: Vec<[f64; 2]>,
     /// Rate the response curve was computed for.
     plot_rate: u32,
@@ -58,11 +56,6 @@ pub struct App {
     /// Holder the user is being asked to confirm a close request for.
     pub confirm_close: Option<router_engine::HolderInfo>,
     pub close_msg: Option<String>,
-    /// Source preset the user picked and still has to confirm (first switch only).
-    pub pending_preset: Option<eq_core::SourcePreset>,
-    /// When the readiness check was last requested.
-    pub readiness_requested: Option<Instant>,
-    pub sound_settings_error: Option<String>,
     last_file_poll: Instant,
     last_bridge_poll: Instant,
     last_autostart_poll: Instant,
@@ -124,6 +117,9 @@ impl App {
                 Config::default()
             }
         };
+        if let Some(n) = eq_core::take_deprecation_notice() {
+            crate::dlog(&n);
+        }
         let settings = AppSettings::load();
         let seen_mtime = config_path.as_ref().and_then(eq_core::modified);
         let now = Instant::now();
@@ -153,8 +149,6 @@ impl App {
             learn_seen: 0,
             devices: Vec::new(),
             device_error: None,
-            captures: Vec::new(),
-            capture_list_error: None,
             eq_error: None,
             config_error,
             settings_error: None,
@@ -165,9 +159,6 @@ impl App {
             bridge_running: sys::bridge_running(),
             confirm_close: None,
             close_msg: None,
-            pending_preset: None,
-            readiness_requested: None,
-            sound_settings_error: None,
             last_file_poll: now,
             last_bridge_poll: now,
             last_autostart_poll: now,
@@ -192,7 +183,6 @@ impl App {
         }
         app.settings.run_at_login = app.autostart_status.is_on();
         app.refresh_devices();
-        app.refresh_captures();
         app.refresh_panel_path();
         if app.args.start_engine(app.settings.auto_start) {
             app.start_engine();
@@ -213,19 +203,6 @@ impl App {
             }
         }
         self.refresh_panel_path();
-    }
-
-    pub fn refresh_captures(&mut self) {
-        match wasapi_capture::list_endpoints(wasapi_capture::Flow::Capture) {
-            Ok(list) => {
-                self.captures = list.into_iter().map(|e| e.name).collect();
-                self.capture_list_error = None;
-            }
-            Err(e) => {
-                self.captures.clear();
-                self.capture_list_error = Some(format!("Could not list capture devices: {e}"));
-            }
-        }
     }
 
     pub fn refresh_panel_path(&mut self) {
@@ -423,6 +400,9 @@ impl App {
         self.seen_mtime = mtime;
         match Config::load(path) {
             Ok(cfg) => {
+                if let Some(n) = eq_core::take_deprecation_notice() {
+                    crate::dlog(&n);
+                }
                 let cfg = cfg.sanitized();
                 if cfg != self.cfg {
                     self.cfg = cfg;
@@ -435,7 +415,8 @@ impl App {
     }
 
     /// A finished "Learn (30 s)" run: lock the measured minimal safe headroom in as the persisted
-    /// per-device jitter margin (`Config::set_jitter_margin`) (saved and applied through the normal debounced path).
+    /// Stores the learned jitter margin for the bridge source
+    /// (`Config::set_jitter_margin`) (saved and applied through the normal debounced path).
     fn apply_learn_result(&mut self) {
         let Some(l) = self.snap.status.as_ref().map(|s| s.learn.clone()) else { return };
         if l.finished < self.learn_seen {
@@ -620,6 +601,8 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 panels::background::ui(ui, self);
                 ui.separator();
+                panels::bridge::ui(ui, self);
+                ui.separator();
                 panels::device::ui(ui, self);
                 ui.separator();
                 panels::rate::ui(ui, self);
@@ -641,7 +624,6 @@ impl eframe::App for App {
             });
         });
         self.close_dialog(&ctx);
-        panels::source::confirm_dialog(&ctx, self);
     }
 }
 

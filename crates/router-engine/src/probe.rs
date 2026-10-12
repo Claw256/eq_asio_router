@@ -3,9 +3,10 @@
 //!
 //! Two detection points, both threshold detectors armed by the control thread:
 //!
-//! * **capture** (`CaptureSink::on_frames`, the cable's capture packets): first sample above the
-//!   threshold -> QPC at callback entry + frame offset within the packet. This is the instant the
-//!   router first sees the click (render side + cable + capture delivery).
+//! * **capture** (the source tap in `Pipeline::render`, i.e. every block popped from ring A
+//!   while armed — the bridge path `router-cli latency` measures): first sample above the
+//!   threshold -> QPC at the pop (callback entry) + frame offset within the block. This is the
+//!   instant the router first sees the click (render side + VBMatrix + ring A delivery).
 //! * **loopback** (the ASIO audio callback, the Yamaha's own inputs "UR22C Streaming L/R", which carry
 //!   the internal loopback of the output mix): first sample above the threshold in the input buffer
 //!   half `index` -> QPC at callback entry + sample offset.
@@ -25,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use asio_abi::AsioSampleType;
 use router_core::asio_convert::read_asio_to_f32;
-use wasapi_capture::{click_samples, onset_index, ImpulseShape};
+use router_core::click::{click_samples, onset_index, ImpulseShape};
 
 use crate::baseline::{ChannelReport, HighPass, Monitor};
 use crate::pipeline::PtrTable;
@@ -188,7 +189,7 @@ pub struct ProbeInfo {
     pub capture_period_frames: u32,
 }
 
-/// State shared by the engine, the audio callback, the capture sink and the [`LatencyProbe`] handle.
+/// State shared by the engine, the audio callback, the source tap and the [`LatencyProbe`] handle.
 #[derive(Default)]
 pub struct ProbeShared {
     pub capture: Detector,
@@ -458,15 +459,16 @@ pub fn onset_bias_frames(shape: ImpulseShape, rate: u32, threshold: f32, peak: f
     onset_index(&click_samples(shape, rate, -40.0), ratio) as f64
 }
 
-pub use wasapi_capture::band::{band_gain_db, band_onset_bias_frames};
+pub use router_core::band::{band_gain_db, band_onset_bias_frames};
 
 /// All figures of one impulse, milliseconds unless noted.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Measurement {
-    /// QPC at injection (submission) to the capture packet that carried the click (render side + cable +
-    /// capture delivery). `None` if the capture side did not see it.
+    /// QPC at injection (submission) to the source block that carried the click (render side +
+    /// VBMatrix + ring A delivery; stage 1 via the engine's ring-A source tap).
+    /// `None` if the source side did not see it.
     pub stage1_ms: Option<f64>,
-    /// Injection to the estimated instant the click leaves the render client (queue delay in the WASAPI
+    /// (a) Injection to the estimated instant the click leaves the render client (queue delay in the WASAPI
     /// render stream). `None` if unknown.
     pub render_queue_ms: Option<f64>,
     /// Injection to the callback that delivered the loopback block (callback-entry, quantised by the block).

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Headroom: an audio waveform safely beneath a ceiling">
+  <title>Headroom</title>
+  <!--
+    Headroom icon — an audio sine wave with a safe margin beneath the ceiling.
+    The gap between the wave's crests and the ceiling line IS the headroom.
+
+    Usage:
+      - GitHub repo/org avatar: upload a 1024x1024 raster export of this file
+      - README logo: <img src="docs/assets/headroom-icon.svg" width="96" alt="Headroom">
+      - Monochrome contexts: replace the three stroke colors with currentColor
+      - Favicon / .ico: rasterize at 16/32/256 px (keep stroke-width >= 24
+        relative to a 512 viewBox, already satisfied here)
+  -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="32">
+    <!-- ceiling: the limit you never touch -->
+    <path d="M80 128 H432" stroke="#FF7A66"/>
+    <!-- baseline (0 dB axis) -->
+    <path d="M64 400 H448" stroke="#8B94A6"/>
+    <!-- sine wave: 2.5 cycles, 3 crests, exact mirror about x=256;
+         one cubic per half-wave (sine approximation, exact at extremes).
+         crests y=220 (60 px under ceiling), troughs y=340 (28 px above axis) -->
+    <path d="M64 280 C89.6 200 115.2 200 140.8 280 C166.4 360 192 360 217.6 280 C243.2 200 268.8 200 294.4 280 C320 360 345.6 360 371.2 280 C396.8 200 422.4 200 448 280" stroke="#3EC6FF"/>
+  </g>
+</svg>

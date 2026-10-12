@@ -2,7 +2,6 @@
 
 use asio_host::Holder;
 use eq_core::{FaultState, LatencyBreakdown};
-use wasapi_capture::CaptureMode;
 
 use crate::priority::HardeningReport;
 
@@ -70,23 +69,12 @@ pub struct LearnStatus {
     pub error: Option<String>,
 }
 
-/// The silent render stream kept alive on a virtual cable's render endpoint.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct KeepAliveStatus {
-    /// Render endpoint it runs on (e.g. "Line 1 (Virtual Audio Cable)").
-    pub render_name: String,
-    /// Shared-engine period of that endpoint before / after the keep-alive started, in ms
-    /// (`None` = could not be read). VAC Line 1: 10.0 -> 1.0.
-    pub engine_period_before_ms: Option<f32>,
-    pub engine_period_after_ms: Option<f32>,
-}
-
 /// Snapshot of everything a GUI wants to show. Cheap to clone.
 #[derive(Clone, Debug, Default)]
 pub struct EngineStatus {
     pub state: EngineState,
     pub master_name: String,
-    /// Rate of the WASAPI capture stream (Hz).
+    /// Rate of the source (the negotiated bridge format; the synthetic rate in measurements) in Hz.
     pub cable_rate: u32,
     /// Rate of the ASIO master (Hz).
     pub asio_rate: u32,
@@ -113,12 +101,12 @@ pub struct EngineStatus {
     pub drift_ppm: f32,
     pub fault: FaultState,
     pub non_finite: u64,
-    pub capture_mode_requested: Option<CaptureMode>,
-    pub capture_mode_in_use: Option<CaptureMode>,
-    pub capture_device: String,
+    /// Name of the source side: `bridge::BRIDGE_SOURCE_NAME` (or "synthetic source" in measurements).
+    pub source_name: String,
+    /// Source period in frames (the negotiated bridge buffer; the synthetic packet size in measurements).
     pub capture_period_frames: u32,
     pub capture_period_us: u32,
-    /// Largest number of frames delivered by one capture callback.
+    /// Largest number of frames delivered by one source burst (synthetic measurements; 0 on the bridge).
     pub capture_burst_max_frames: u32,
     /// Callback load: average / worst duration in microseconds and as percent of the period.
     pub cpu_avg_us: f32,
@@ -154,32 +142,24 @@ pub struct EngineStatus {
     pub last_error: Option<String>,
     /// Processes currently holding the master driver (empty unless waiting for it).
     pub busy_holders: Vec<HolderInfo>,
-    pub capture_error: Option<String>,
-    /// Non-error remark about the capture mode actually used (e.g. Exclusive mapped to Shared).
-    pub capture_note: Option<String>,
-    /// Fixed capture period the config asks for, in frames at the capture rate (0 = driver default),
-    /// and the period actually granted by WASAPI (same value as `capture_period_frames`).
-    pub capture_period_frames_requested: u32,
-    pub capture_period_frames_granted: u32,
-    /// Set (and kept until the capture device / period changes) when a fixed-period capture was
-    /// abandoned because the corruption monitor tripped:
-    /// "Capture fell back to Shared (10 ms): <reason>".
-    pub capture_fallback: Option<String>,
-    /// The render keep-alive, while it runs.
-    pub keepalive: Option<KeepAliveStatus>,
-    /// Why a requested keep-alive is not running (non-fatal), or a remark about it.
-    pub keepalive_note: Option<String>,
-    /// Source preset of the config in force.
-    pub source_preset: eq_core::SourcePreset,
-    /// Rate the Hi-Fi Cable had before the router set it to the master's rate.
-    pub cable_rate_changed_from: Option<u32>,
-    /// Human-readable result of the cable rate matching (success or how to fix it manually).
-    pub cable_rate_note: Option<String>,
-    /// Capture-side counters of the running session: packets, DATA_DISCONTINUITY flags
-    /// (after the first packet), silent-flagged packets.
-    pub capture_packets: u64,
-    pub capture_discontinuities: u64,
-    pub capture_silent_packets: u64,
+    /// The engine is attached to the bridge mapping (`Local\eq_asio_router_bridge_v2`).
+    pub bridge_attached: bool,
+    /// The VBMatrix-driven driver slot is running with a fresh heartbeat
+    /// (`driver_running` + no stall within `bridge::BEAT_STALL`).
+    pub vbmatrix_running: bool,
+    /// Sample rate the driver negotiated with VBMatrix (Hz); also the source rate.
+    pub bridge_sample_rate: u32,
+    /// ASIO buffer size the driver negotiated (frames); the producer's burst size.
+    pub bridge_buffer_frames: u32,
+    /// Frames currently in ring A (source) / ring B (loopback).
+    pub fill_a: u32,
+    pub fill_b: u32,
+    /// Ring counters (frames): ring A dropped by the driver / discarded by the
+    /// app's latency trim; ring B starved for the driver / dropped by the app.
+    pub a_overruns: u64,
+    pub a_discarded: u64,
+    pub b_underruns: u64,
+    pub b_dropped: u64,
     /// Last config reload failure from the watched file.
     pub config_error: Option<String>,
     pub dropped_logs: u64,
@@ -206,10 +186,8 @@ pub enum EngineError {
     UnsupportedSampleType(i32),
     #[error("ASIO error: {0}")]
     Asio(String),
-    #[error("capture device \"{0}\" not found")]
-    CaptureDeviceNotFound(String),
-    #[error("capture error: {0}")]
-    Capture(String),
+    #[error("bridge {0}")]
+    Bridge(String),
     #[error("thread error: {0}")]
     Thread(String),
     #[error("the engine is stopped")]
@@ -241,19 +219,17 @@ impl EngineError {
             EngineError::MasterNotFound(_)
                 | EngineError::MasterOpen { .. }
                 | EngineError::MasterBusy { .. }
-                | EngineError::CaptureDeviceNotFound(_)
-                | EngineError::Capture(_)
+                | EngineError::Bridge(_)
                 | EngineError::Asio(_)
         )
     }
 
-    /// Short status text for a retryable error, e.g. "Waiting for Hi-Fi Cable Output...".
+    /// Short status text for a retryable error, e.g. "Waiting for the VBMatrix bridge (...)".
     pub fn waiting_text(&self) -> String {
         match self {
             EngineError::MasterNotFound(n) => format!("Waiting for ASIO driver \"{n}\" to appear\u{2026}"),
-            EngineError::CaptureDeviceNotFound(n) => format!("Waiting for {n}\u{2026}"),
             EngineError::MasterOpen { name, .. } => format!("Waiting for {name} to open\u{2026}"),
-            EngineError::Capture(d) => format!("Waiting for the capture device ({d})\u{2026}"),
+            EngineError::Bridge(d) => format!("Waiting for the VBMatrix bridge ({d})\u{2026}"),
             EngineError::Asio(d) => format!("Waiting for the ASIO driver ({d})\u{2026}"),
             other => other.to_string(),
         }
@@ -288,9 +264,9 @@ mod tests {
 
     #[test]
     fn unavailable_classification_and_text() {
-        let nf = EngineError::CaptureDeviceNotFound("Hi-Fi Cable Output".into());
-        assert!(nf.is_unavailable() && !nf.is_fatal());
-        assert_eq!(nf.waiting_text(), "Waiting for Hi-Fi Cable Output\u{2026}");
+        let b = EngineError::Bridge("mapping not found".into());
+        assert!(b.is_unavailable() && !b.is_fatal());
+        assert_eq!(b.waiting_text(), "Waiting for the VBMatrix bridge (mapping not found)\u{2026}");
         let m = EngineError::MasterNotFound("Yamaha".into());
         assert!(m.is_unavailable() && m.is_fatal());
         assert!(m.waiting_text().starts_with("Waiting for ASIO driver"));

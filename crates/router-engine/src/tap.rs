@@ -1,7 +1,8 @@
 //! Optional measurement tap: copies the stereo stream at three points of the path into
 //! 32-bit float WAV files, for offline analysis (`router-cli analyze`).
 //!
-//! * `capture_in.wav`: what the capture sink delivers (cable rate)
+//! * `capture_in.wav`: what the source delivers to the pipeline (bridge ring-A pops or the
+//!   synthetic ring; source rate)
 //! * `after_resample.wav`: rate matcher output (ASIO rate)
 //! * `after_eq.wav`: the final block, exactly what is converted into the ASIO buffer
 //!
@@ -32,7 +33,7 @@ pub const TAP_NAMES: [&str; 3] = ["capture_in", "after_resample", "after_eq"];
 /// Ring capacity per tap in frames (~3 s).
 const TAP_RING: usize = 1 << 17;
 
-/// Producer end of one tap point (lives in the capture sink or the audio callback).
+/// Producer end of one tap point (lives in the pipeline's source tap or the audio callback).
 pub struct TapPoint {
     prod: Producer,
 }

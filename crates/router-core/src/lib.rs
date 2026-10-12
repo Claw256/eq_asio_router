@@ -8,6 +8,8 @@
 pub mod analyze;
 pub mod arrival;
 pub mod asio_convert;
+pub mod band;
+pub mod click;
 pub mod logger;
 pub mod processor;
 pub mod resample;

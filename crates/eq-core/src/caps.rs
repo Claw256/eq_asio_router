@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn latency_maths() {
-        let est = RenderSide::estimate_for("Line 1 (Virtual Audio Cable)");
+        let est = RenderSide::estimate();
         let b = yamaha().latency_breakdown(2.0, 10.0, est);
         assert!((b.master_out_ms - 871.0 / 48.0).abs() < 1e-9);
         assert!((b.master_in_ms - 728.0 / 48.0).abs() < 1e-9);
@@ -208,7 +208,7 @@ mod tests {
     fn latency_has_no_double_count() {
         // Cable path: 1210-frame target at 48 kHz (25.2 ms), paired bursts (10 ms staleness):
         // the old maths added a whole capture period on top of the target (burst already inside).
-        let b = yamaha().latency_breakdown(1210.0 / 48.0, 10.0, RenderSide::estimate_for("Hi-Fi Cable Output"));
+        let b = yamaha().latency_breakdown(1210.0 / 48.0, 10.0, RenderSide::estimate());
         let parts = b.master_out_ms + b.ring_ms + b.capture_ms + b.render_side_ms;
         assert!((b.total_ms - parts).abs() < 1e-9);
         assert!(b.buffer_ms > 0.0, "the driver buffer is informational, already inside master_out");

@@ -7,9 +7,12 @@ pub const STATUS_MAPPING_NAME: &str = "Local\\eq_asio_router_status";
 /// Magic value ("EQST" little endian).
 pub const STATUS_MAGIC: u32 = u32::from_le_bytes(*b"EQST");
 /// Layout version.
-pub const STATUS_VERSION: u32 = 2;
+/// v2: fault/effective-rate/fill/latency fields.
+/// v3: grew to 192 bytes, added the VBMatrix bridge block (`bridge_attached` .. `b_dropped`).
+/// Old readers reject v3 (`is_valid`) and old v2 mappings are rejected by v3 readers.
+pub const STATUS_VERSION: u32 = 3;
 
-/// Plain-old-data status block, exactly 128 bytes.
+/// Plain-old-data status block, exactly 192 bytes (3 cache lines).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StatusBlock {
@@ -50,10 +53,30 @@ pub struct StatusBlock {
     pub safety_buffer_us: u32,
     /// v2: log lines dropped by the logger ring.
     pub dropped_logs: u32,
-    pub _reserved: [u8; 20],
+    /// v3: the engine is attached to the bridge mapping.
+    pub bridge_attached: u32,
+    /// v3: the driver slot is running and its heartbeat is fresh (`driver_running` + beat).
+    pub vbmatrix_running: u32,
+    /// v3: sample rate negotiated by the driver with VBMatrix (Hz).
+    pub bridge_sample_rate: u32,
+    /// v3: ASIO buffer size negotiated by the driver (frames).
+    pub bridge_buffer_frames: u32,
+    /// v3: frames currently in ring A (source, driver -> app).
+    pub fill_a: u32,
+    /// v3: frames currently in ring B (loopback, app -> driver).
+    pub fill_b: u32,
+    /// v3: frames dropped by the driver's `ring_a_push` (ring A full).
+    pub a_overruns: u32,
+    /// v3: frames discarded by the app's consumer-side latency trim.
+    pub a_discarded: u32,
+    /// v3: frames the driver's `ring_b_pop` could not provide (fed as silence).
+    pub b_underruns: u32,
+    /// v3: frames dropped by the app's `ring_b_push` (ring B full).
+    pub b_dropped: u32,
+    pub _reserved: [u8; 44],
 }
 
-const _: () = assert!(std::mem::size_of::<StatusBlock>() == 128);
+const _: () = assert!(std::mem::size_of::<StatusBlock>() == 192);
 const _: () = assert!(std::mem::align_of::<StatusBlock>() == 8);
 
 impl StatusBlock {
@@ -85,7 +108,17 @@ impl StatusBlock {
             capture_period_us: 0,
             safety_buffer_us: 0,
             dropped_logs: 0,
-            _reserved: [0; 20],
+            bridge_attached: 0,
+            vbmatrix_running: 0,
+            bridge_sample_rate: 0,
+            bridge_buffer_frames: 0,
+            fill_a: 0,
+            fill_b: 0,
+            a_overruns: 0,
+            a_discarded: 0,
+            b_underruns: 0,
+            b_dropped: 0,
+            _reserved: [0; 44],
         }
     }
 
@@ -108,7 +141,7 @@ mod tests {
 
     #[test]
     fn layout_is_stable() {
-        assert_eq!(size_of::<StatusBlock>(), 128);
+        assert_eq!(size_of::<StatusBlock>(), 192);
         assert_eq!(offset_of!(StatusBlock, callbacks), 24);
         assert_eq!(offset_of!(StatusBlock, xruns), 32);
         assert_eq!(offset_of!(StatusBlock, peak_in_l), 40);
@@ -118,7 +151,17 @@ mod tests {
         assert_eq!(offset_of!(StatusBlock, ring_fill_frames), 76);
         assert_eq!(offset_of!(StatusBlock, safety_buffer_us), 100);
         assert_eq!(offset_of!(StatusBlock, dropped_logs), 104);
-        assert_eq!(offset_of!(StatusBlock, _reserved), 108);
+        assert_eq!(offset_of!(StatusBlock, bridge_attached), 108);
+        assert_eq!(offset_of!(StatusBlock, vbmatrix_running), 112);
+        assert_eq!(offset_of!(StatusBlock, bridge_sample_rate), 116);
+        assert_eq!(offset_of!(StatusBlock, bridge_buffer_frames), 120);
+        assert_eq!(offset_of!(StatusBlock, fill_a), 124);
+        assert_eq!(offset_of!(StatusBlock, fill_b), 128);
+        assert_eq!(offset_of!(StatusBlock, a_overruns), 132);
+        assert_eq!(offset_of!(StatusBlock, a_discarded), 136);
+        assert_eq!(offset_of!(StatusBlock, b_underruns), 140);
+        assert_eq!(offset_of!(StatusBlock, b_dropped), 144);
+        assert_eq!(offset_of!(StatusBlock, _reserved), 148);
     }
 
     #[test]

@@ -2,15 +2,13 @@
 //! the pipeline up, supervises it and restarts it with back-off.
 //!
 //! Teardown order (see `Session::drop`): heartbeat off, watchdog stopped, ASIO stream
-//! stopped, buffers disposed and the driver released, then the render keep-alive stopped,
-//! then the capture session stopped and the config watcher joined, so the Yamaha is always
-//! left released and the audio callback never outlives the ring it reads. The keep-alive goes
-//! BEFORE the capture: it is a pure render-side helper (a silent stream into the cable); ending it
-//! first lets the cable's render engine period settle back while the capture is still draining,
-//! so the capture thread never sees the period renegotiation as an anomaly of its own session.
+//! stopped, buffers disposed and the driver released, then the loopback feeder stopped,
+//! the synthetic source (measurements only) stopped, the config watcher joined and the
+//! measurement tap finished, so the Yamaha is always left released and the audio callback
+//! never outlives the ring it reads.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -27,10 +25,9 @@ use router_core::processor::{validate_output_channels, EqProcessor, Handoff, Sna
 use router_core::resample::{RateMatcher, RateMatcherConfig};
 use router_core::ring;
 use router_core::rlog;
-use router_core::status_writer::{StaticInfo, StatusWriter};
+use router_core::status_writer::{BridgeReport, StaticInfo, StatusWriter};
 use router_core::watchdog::{Component, Heartbeat, Watchdog, WatchdogEvent};
 use router_core::watcher::ConfigWatcher;
-use wasapi_capture::{is_virtual_cable_name, CaptureEvent, CaptureSession, RenderKeepAlive, RenderKeepAliveOptions};
 use windows::core::w;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND};
 use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, SetEvent};
@@ -39,22 +36,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PM_REMOVE, QS_ALLINPUT,
 };
 
-use crate::cable::{self, CableFormatsHandle, WindowsCableFormats};
+use crate::bridge::{self, BridgeAttach, BridgeMonitor, BridgeSample, FillWindow, LEARN_MIN_TICKS};
 use crate::logic::{
     choose_buffer_size, classify_change, cpu_percent, effective_master, frames_to_ms, is_forbidden_master,
     plan_capacity, plan_target, to_db, AutoSafety, Backoff, ConfigChange, HolderTracker, StallTracker, WAIT_RETRY,
 };
 use crate::pipeline::{
-    qpc_freq, quality_to_u8, AudioCallback, CaptureSink, Live, OutputSet, Pipeline, PipelineInit, PtrTable,
+    qpc_freq, quality_to_u8, AudioCallback, Live, OutputSet, Pipeline, PipelineInit, PipelineSource, PtrTable, SynthFeeder,
     RESET_PANIC, RESET_RATE, RESET_REQUEST,
 };
 use crate::priority::{self, ControlMmcss, HardeningReport, TimerResolution};
 use crate::probe::{select_input_channels, LatencyProbe, LoopbackProbe, LoopbackTap, ProbeInfo, ProbeShared};
 use crate::synth::{self, SynthHandle, SyntheticSource};
 use crate::tap::{self, TapConfig, TapSession};
-use crate::source::{plan_capture, CorruptionAction, FallbackState};
 use crate::status::{
-    map_open_error, ApplyOutcome, EngineError, EngineState, EngineStatus, HolderInfo, KeepAliveStatus, LearnStatus,
+    map_open_error, ApplyOutcome, EngineError, EngineState, EngineStatus, HolderInfo, LearnStatus,
 };
 
 /// Interval of the slow-field status publisher.
@@ -106,19 +102,19 @@ pub struct EngineOptions {
     pub status_mapping: bool,
     /// Measurement tap (writes WAV dumps of the stream at three points); `None` = off.
     pub tap: Option<TapConfig>,
-    /// Replaces the Windows cable-format reader/writer (tests). `None` = the real one.
-    pub cable_formats: Option<CableFormatsHandle>,
-    /// Replaces the WASAPI capture by a synthetic source (measurements); `None` = real capture.
+    /// Feeds the pipeline from an in-process synthetic signal source (tone with a packet/jitter
+    /// model) instead of attaching to the VBMatrix bridge (hardware measurements);
+    /// `None` = the bridge (the real source).
     pub synthetic: Option<SyntheticSource>,
     /// Keep retrying (back-off capped at 5 s) when a device is not available yet, even on the
-    /// very first start: ASIO driver not registered/enumerated (`MasterNotFound`), capture
-    /// device missing (`CaptureDeviceNotFound`), audio service not ready, driver open failures.
+    /// very first start: ASIO driver not registered/enumerated (`MasterNotFound`), the bridge
+    /// mapping not published yet (`Bridge`), driver open failures.
     /// Meant for login-time starts where devices appear a few seconds late. When `false`
     /// (default, used by `router-cli`) such errors on the first start are returned to the caller.
     pub retry_unavailable: bool,
     /// Latency measurement (`router-cli latency`): also create the Yamaha's loopback input buffers
-    /// ("UR22C Streaming L/R") and let [`Engine::latency_probe`] detect an injected click there and on the
-    /// capture side. `None` (default) creates no extra buffers and adds no work to the callbacks.
+    /// ("UR22C Streaming L/R") and let [`Engine::latency_probe`] detect an injected click there and on
+    /// the bridge source side. `None` (default) creates no extra buffers and adds no work to the callbacks.
     pub loopback_probe: Option<LoopbackProbe>,
     /// Read `latency_measured.toml` (written by `router-cli latency`) so the latency readout uses the measured
     /// render side. `router-cli latency` itself turns this off, so its model line shows the pure estimate.
@@ -133,7 +129,6 @@ impl Default for EngineOptions {
             publish_caps: true,
             status_mapping: true,
             tap: None,
-            cable_formats: None,
             synthetic: None,
             retry_unavailable: false,
             loopback_probe: None,
@@ -237,17 +232,15 @@ struct Shared {
     wake: Wake,
     /// Base safety buffer (f32 bits), updated by `apply`.
     base_safety: AtomicU32,
+    /// `[bridge] ring_target_ms` floor of the ring-A target (f32 bits), updated by `apply`.
+    bridge_target_ms: AtomicU32,
     safety_auto: AtomicBool,
-    /// Learned jitter headroom floor in ms (f32 bits) of the current capture device
+    /// Learned jitter headroom floor in ms (f32 bits) of the bridge source
     /// (`Config::jitter_margin_for`).
     jitter_floor_ms: AtomicU32,
     /// "Learn (30 s)" requested (consumed by the status tick).
     learn_req: AtomicBool,
-    /// Forget a corruption fallback ("Retry fixed period"); consumed before the next session start.
-    reset_fallback_req: AtomicBool,
     n_out: AtomicU32,
-    /// Last cable-matching attempt (target rate, when, succeeded): never retried in a loop.
-    cable_attempt: Mutex<Option<(u32, Instant, bool)>>,
     /// Latency probe state (only when `EngineOptions::loopback_probe` is set).
     probe: Option<Arc<ProbeShared>>,
     opts: EngineOptions,
@@ -262,8 +255,9 @@ impl Shared {
         let mut cur = lock(&self.config);
         let change = classify_change(&cur, &new, effective_rate);
         self.base_safety.store(new.safety_buffer_ms.to_bits(), Relaxed);
+        self.bridge_target_ms.store(new.bridge.ring_target_ms.to_bits(), Relaxed);
         self.safety_auto.store(new.safety_buffer_auto, Relaxed);
-        self.jitter_floor_ms.store(new.jitter_margin_for(&new.capture_device).to_bits(), Relaxed);
+        self.jitter_floor_ms.store(new.jitter_margin_for().to_bits(), Relaxed);
         self.live.quality.store(quality_to_u8(new.resampler_quality), Relaxed);
         *cur = new;
         change
@@ -306,17 +300,16 @@ impl Engine {
         let shared = Arc::new(Shared {
             status: Mutex::new(EngineStatus { state: EngineState::Starting, ..EngineStatus::default() }),
             base_safety: AtomicU32::new(cfg.safety_buffer_ms.to_bits()),
+            bridge_target_ms: AtomicU32::new(cfg.bridge.ring_target_ms.to_bits()),
             safety_auto: AtomicBool::new(cfg.safety_buffer_auto),
-            jitter_floor_ms: AtomicU32::new(cfg.jitter_margin_for(&cfg.capture_device).to_bits()),
+            jitter_floor_ms: AtomicU32::new(cfg.jitter_margin_for().to_bits()),
             learn_req: AtomicBool::new(false),
-            reset_fallback_req: AtomicBool::new(false),
             config: Mutex::new(cfg),
             caps: Mutex::new(None),
             live,
             handoff: Arc::new(Handoff::new()),
             wake: Wake::new()?,
             n_out: AtomicU32::new(0),
-            cable_attempt: Mutex::new(None),
             probe: opts.loopback_probe.as_ref().map(|_| Arc::new(ProbeShared::default())),
             opts,
         });
@@ -406,9 +399,10 @@ impl Engine {
         }
     }
 
-    /// Starts the "Learn (30 s)" measurement: forgets the arrival statistics, measures for
+    /// Starts the "Learn (30 s)" measurement: forgets the fill statistics, measures for
     /// [`LEARN_SECS`] and publishes the lowest safe jitter headroom in `EngineStatus::learn`
-    /// (the GUI stores it per capture device via `Config::set_jitter_margin` into `jitter_margin_by_device`). No effect unless the engine is streaming.
+    /// (the GUI stores it with `Config::set_jitter_margin` under the fixed `"vbmatrix"` key).
+    /// No effect unless the engine is streaming.
     pub fn learn_jitter(&self) {
         self.shared.learn_req.store(true, Relaxed);
         self.shared.wake.set();
@@ -427,13 +421,6 @@ impl Engine {
     /// Requests a controlled restart of the stream.
     pub fn restart(&self) {
         self.send(Cmd::Restart("restart requested"));
-    }
-
-    /// Forgets a corruption fallback and restarts the stream so fixed-period capture is tried again
-    /// (a plain re-send of the same config would not reset it: only a device/period change does).
-    pub fn reset_fallback(&self) {
-        self.shared.reset_fallback_req.store(true, Relaxed);
-        self.send(Cmd::Restart("retrying fixed capture period"));
     }
 
     fn send(&self, c: Cmd) {
@@ -524,22 +511,36 @@ struct SessionInfo {
     asio_rate: u32,
     buffer: u32,
     capture_period: u32,
-    capture_device: String,
-    capture_requested: wasapi_capture::CaptureMode,
-    /// Fixed period the config asked for (frames; 0 = driver default).
-    period_requested: u32,
+    /// Name of the source side (`bridge::BRIDGE_SOURCE_NAME`, or "synthetic source").
+    source_name: String,
     outputs: [usize; 2],
     ring_capacity: u32,
+}
+
+/// Where the running session takes its source frames (and statistics) from.
+enum SourceSide {
+    /// In-process ring fed from the synthetic source thread (measurements): packet-arrival model.
+    Capture(Arc<ArrivalStats>),
+    /// Shared-memory ring A from the VBMatrix-driven driver: ring-fill statistics plus
+    /// the driver's heartbeat (see `bridge`).
+    Bridge { attach: BridgeAttach, window: FillWindow, monitor: BridgeMonitor },
+}
+
+/// Bridge values sampled once per control tick (EngineStatus + status block).
+struct BridgeTick {
+    sample: BridgeSample,
+    fill_a: u32,
+    fill_b: u32,
+    a_overruns: u64,
+    a_discarded: u64,
+    b_underruns: u64,
+    b_dropped: u64,
 }
 
 struct Session {
     driver: Option<AsioDriver>,
     buffers_created: bool,
     streaming: bool,
-    capture: Option<CaptureSession>,
-    /// Silent render stream on the cable's render endpoint (stopped before `capture`).
-    keepalive: Option<RenderKeepAlive>,
-    keepalive_status: Option<KeepAliveStatus>,
     synth: Option<SynthHandle>,
     watchdog: Option<Watchdog>,
     cfg_watcher: Option<ConfigWatcher>,
@@ -550,8 +551,12 @@ struct Session {
     info: SessionInfo,
     caps: Caps,
     started: Instant,
-    /// Arrival statistics of the capture sink and the planner that turns them into the headroom.
-    arrival: Arc<ArrivalStats>,
+    /// Source statistics: arrival model (synthetic) or ring-fill window + bridge liveness.
+    src: SourceSide,
+    /// Loopback feeder thread (bridge + `[bridge] loopback_enabled`); stopped before the
+    /// mapping can go away.
+    loopback: Option<bridge::LoopbackFeeder>,
+    /// Planner that turns the source statistics into the jitter headroom.
     planner: HeadroomPlanner,
     /// Engine time at which the running "Learn" window started.
     learn_started: Option<Duration>,
@@ -579,11 +584,8 @@ impl Drop for Session {
             }
             drop(d); // Release the Yamaha before the capture side goes away.
         }
-        if let Some(mut k) = self.keepalive.take() {
-            k.stop(); // before the capture, see the module docs
-        }
-        if let Some(mut c) = self.capture.take() {
-            c.stop();
+        if let Some(mut lb) = self.loopback.take() {
+            lb.stop(); // taps the callback's ring; must end before the mapping drops
         }
         if let Some(mut y) = self.synth.take() {
             y.stop();
@@ -600,100 +602,12 @@ impl Drop for Session {
     }
 }
 
-/// Applies `match_cable_rate`: sets the cable endpoints to `rate` when they differ and records the
-/// outcome in the status. Runs once per start; a failed attempt for the same rate is not
-/// repeated within 60 s. Failure is non-fatal (the resampler copes with the mismatch).
-fn run_cable_match(sh: &Shared, cfg: &Config, rate: u32) {
-    if !cfg.match_cable_rate || !cable::is_cable_name(&cfg.capture_device) || rate == 0 {
-        let mut st = lock(&sh.status);
-        st.cable_rate_changed_from = None;
-        st.cable_rate_note = None;
-        return;
-    }
-    let now = Instant::now();
-    let last = *lock(&sh.cable_attempt);
-    if !cable::should_attempt(last, rate, now) {
-        rlog!(Level::Info, "cable rate matching to {rate} Hz skipped (failed recently)");
-        return;
-    }
-    let base = wasapi_capture::cable_base_name(&cfg.capture_device);
-    let provider: Arc<dyn cable::CableFormats> = match &sh.opts.cable_formats {
-        Some(h) => h.0.clone(),
-        None => Arc::new(WindowsCableFormats),
-    };
-    let out = cable::match_cable(&*provider, &base, rate, Duration::from_millis(1500), Duration::from_millis(100));
-    if let Some(note) = &out.note {
-        rlog!(if out.failed { Level::Warn } else { Level::Info }, "{note}");
-    }
-    *lock(&sh.cable_attempt) = if out.failed { Some((rate, now, false)) } else { None };
-    if out.note.is_some() {
-        let mut st = lock(&sh.status);
-        st.cable_rate_changed_from = out.changed_from;
-        st.cable_rate_note = out.note;
-    }
-}
-
-/// Why Exclusive capture is not offered (shown in the status panel and logged).
-pub const EXCLUSIVE_DISABLED_NOTE: &str = "Exclusive capture is disabled: the Hi-Fi Cable driver duplicates/drops packets in exclusive mode (30-70 % of the samples were wrong at 3-5 ms periods; only 10 ms periods were clean, which is no faster than Shared). Using Shared capture instead.";
-
-/// Maps the configured mode to the one actually opened. Exclusive is mapped to Shared
-/// (measured sample-inaccurate on the Hi-Fi Cable); the returned note explains it.
-pub fn effective_capture_mode(m: eq_core::CaptureMode) -> (wasapi_capture::CaptureMode, Option<&'static str>) {
-    match m {
-        eq_core::CaptureMode::Shared => (wasapi_capture::CaptureMode::Shared, None),
-        eq_core::CaptureMode::LowLatency => (wasapi_capture::CaptureMode::LowLatency, None),
-        eq_core::CaptureMode::Exclusive => (wasapi_capture::CaptureMode::Shared, Some(EXCLUSIVE_DISABLED_NOTE)),
-    }
-}
-
-/// Engine period `(frames, rate)` as milliseconds.
-fn period_ms(p: Option<(u32, u32)>) -> Option<f32> {
-    p.filter(|&(_, r)| r > 0).map(|(f, r)| (f64::from(f) * 1000.0 / f64::from(r)) as f32)
-}
-
-/// Starts the render keep-alive if the config asks for it and the capture endpoint is a known
-/// virtual cable. Never fatal: a failure only produces a note.
-fn start_keepalive(cfg: &Config, capture_name: &str) -> (Option<RenderKeepAlive>, Option<KeepAliveStatus>, Option<String>) {
-    if !cfg.render_keepalive {
-        return (None, None, None);
-    }
-    if !is_virtual_cable_name(capture_name) {
-        let n = format!("Render keep-alive skipped: \"{capture_name}\" is not a known virtual cable.");
-        rlog!(Level::Warn, "{n}");
-        return (None, None, Some(n));
-    }
-    match RenderKeepAlive::start_for_capture_endpoint(capture_name, RenderKeepAliveOptions::default()) {
-        Ok(k) => {
-            let i = k.info();
-            let st = KeepAliveStatus {
-                render_name: i.render_name.clone(),
-                engine_period_before_ms: period_ms(i.engine_period_before),
-                engine_period_after_ms: period_ms(i.engine_period_after),
-            };
-            rlog!(
-                Level::Info,
-                "render keep-alive on \"{}\": engine period {:?} -> {:?} ms",
-                st.render_name,
-                st.engine_period_before_ms,
-                st.engine_period_after_ms
-            );
-            (Some(k), Some(st), None)
-        }
-        Err(e) => {
-            let n = format!("Render keep-alive not started: {e}");
-            rlog!(Level::Warn, "{n}");
-            (None, None, Some(n))
-        }
-    }
-}
-
 impl Session {
     fn open(
         sh: &Arc<Shared>,
         cfg: &Config,
         tx: &Sender<Cmd>,
         safety_ms: f32,
-        fallback: &FallbackState,
     ) -> Result<Session, EngineError> {
         let name = effective_master(cfg);
         if is_forbidden_master(&name) {
@@ -743,43 +657,36 @@ impl Session {
         }
         *lock(&sh.caps) = Some(caps.clone());
 
-        // Make the Hi-Fi Cable run at the master's rate (once per start, never fatal).
-        run_cable_match(sh, cfg, asio_rate);
-
-        // Capture side.
+        // Source side: the VBMatrix bridge (the default source) or an in-process synthetic
+        // signal for hardware measurements. The mapping is created by the driver; a missing
+        // mapping or an unpublished format retries through the same back-off machinery as a
+        // missing master (`retry_unavailable` decides whether the first failure is fatal).
         let synthetic = sh.opts.synthetic.clone();
-        let (ep_id, ep_name, hint_rate) = match &synthetic {
-            Some(sy) => (String::new(), "synthetic source".to_string(), sy.rate),
+        let (bridge_attach, bridge_fmt, ep_name, hint_rate) = match &synthetic {
+            Some(sy) => (None, None, "synthetic source".to_string(), sy.rate),
             None => {
-                let ep = wasapi_capture::find_capture_device(Some(&cfg.capture_device)).map_err(|e| match e {
-                    wasapi_capture::CaptureError::NotFound(_) => EngineError::CaptureDeviceNotFound(cfg.capture_device.clone()),
-                    other => EngineError::Capture(other.to_string()),
-                })?;
-                let hint = wasapi_capture::mix_format_sample_rate(&ep.id).unwrap_or(48000).max(8000);
-                (ep.id.clone(), ep.name.clone(), hint)
+                let b = BridgeAttach::attach()?;
+                let fmt = b.negotiated()?;
+                (Some(b), Some(fmt), bridge::BRIDGE_SOURCE_NAME.to_string(), fmt.0)
             }
         };
-        let capacity = plan_capacity(buffer, hint_rate, asio_rate, MAX_PERIOD_FRAMES);
-        let (producer, consumer) = ring::channel(capacity);
-        let ring_capacity = producer.capacity() as u32;
+        let is_bridge = bridge_attach.is_some();
+        let bridge_buffer = bridge_fmt.map_or(0, |(_, buf)| buf);
+        let capacity =
+            if is_bridge { bridge_abi::RING_FRAMES } else { plan_capacity(buffer, hint_rate, asio_rate, MAX_PERIOD_FRAMES) };
+        // The bridge consumes the shm ring directly in the Yamaha callback: no in-process
+        // source ring exists at all.
+        let (producer, consumer) = if is_bridge {
+            (None, None)
+        } else {
+            let (p, c) = ring::channel(capacity);
+            (Some(p), Some(c))
+        };
+        let ring_capacity = producer.as_ref().map_or(bridge_abi::RING_FRAMES as u32, |p| p.capacity() as u32);
         let heartbeat = Arc::new(Heartbeat::new());
         let armed = Arc::new(AtomicBool::new(false));
         let live = sh.live.clone();
         live.reset_counters();
-        let plan = plan_capture(cfg, &ep_name, hint_rate, fallback.forced_shared());
-        let requested = plan.options.mode;
-        if let Some(n) = &plan.note {
-            rlog!(Level::Warn, "{n}");
-        }
-        {
-            let mut st = lock(&sh.status);
-            st.capture_note = plan.note.clone();
-            st.capture_fallback = fallback.text().map(str::to_string);
-            st.capture_period_frames_requested = plan.requested_period_frames;
-            st.source_preset = cfg.source_preset;
-            st.keepalive = None;
-            st.keepalive_note = None;
-        }
         let (tap_pts, tap_ses) = match &sh.opts.tap {
             Some(c) => match tap::start(c, asio_rate) {
                 Ok((p, s)) => (Some(p), Some(s)),
@@ -794,54 +701,74 @@ impl Session {
             Some(p) => (Some(p.capture_in), Some(p.after_resample), Some(p.after_eq)),
             None => (None, None, None),
         };
-        let arrival = ArrivalStats::new(f64::from(hint_rate));
-        let sink = CaptureSink::new(producer, heartbeat.clone(), armed.clone(), live.clone())
-            .with_tap(tap_cap)
-            .with_arrival(Some(arrival.clone()))
-            .with_probe(sh.probe.clone());
-        let (capture, synth_handle, cable_rate, period, mode_in_use) = match synthetic {
-            Some(sy) => {
-                let (rate, period) = (sy.rate, sy.packet_frames);
-                let h = synth::spawn(sy, Box::new(sink)).map_err(|e| EngineError::Capture(e.to_string()))?;
-                (None, Some(h), rate, period, None)
+        let arrival = (!is_bridge).then(|| ArrivalStats::new(f64::from(hint_rate)));
+        // The synthetic feeder writes the in-process ring (the bridge has no producer here:
+        // the shm ring is consumed directly in the Yamaha callback).
+        let sink = match (producer, arrival.as_ref()) {
+            (Some(pr), Some(ar)) => {
+                Some(SynthFeeder::new(pr, heartbeat.clone(), armed.clone(), live.clone()).with_arrival(Some(ar.clone())))
             }
-            None => {
-                let options = wasapi_capture::CaptureOptions { preferred_rate: Some(asio_rate), ..plan.options };
-                let c = CaptureSession::start_with_options(&ep_id, options, Box::new(sink))
-                    .map_err(|e| EngineError::Capture(e.to_string()))?;
-                let (r, p, m) = (c.sample_rate(), c.period_frames(), c.mode_in_use());
-                (Some(c), None, r, p, Some(m))
+            _ => None,
+        };
+        let (synth_handle, cable_rate, period) = match (synthetic, sink) {
+            (Some(sy), sink) => {
+                let (rate, period) = (sy.rate, sy.packet_frames);
+                let Some(sink) = sink else {
+                    return Err(EngineError::Thread("synthetic source not wired".into()));
+                };
+                let h = synth::spawn(sy, sink).map_err(|e| EngineError::Thread(format!("synthetic source: {e}")))?;
+                (Some(h), rate, period)
+            }
+            (None, _) => {
+                let (rate, buf) = bridge_fmt.ok_or_else(|| EngineError::Bridge("no negotiated format".into()))?;
+                (None, rate, buf)
             }
         };
         if let Some(t) = &tap_ses {
             t.set_cable_rate(cable_rate);
         }
-        arrival.set_rate(f64::from(cable_rate));
+        if let Some(a) = &arrival {
+            a.set_rate(f64::from(cable_rate));
+        }
         rlog!(
             Level::Info,
-            "capture \"{}\" {} Hz, period {} frames, mode {:?} (requested {:?})",
-            ep_name,
-            cable_rate,
-            period,
-            mode_in_use,
-            requested
+            "{}",
+            if is_bridge {
+                format!("bridge source \"{}\": {} Hz, driver buffer {} frames", ep_name, cable_rate, period)
+            } else {
+                format!("synthetic source \"{}\" {} Hz, packet {} frames", ep_name, cable_rate, period)
+            }
         );
 
-        // Render keep-alive (declared after `capture`, so an early return drops it first).
-        let (keepalive, keepalive_status, keepalive_note) = if capture.is_some() {
-            start_keepalive(cfg, &ep_name)
-        } else {
-            (None, None, None)
+        // Source statistics side: bridge attach + fill window, or the arrival model.
+        let src = match (bridge_attach, arrival) {
+            (Some(attach), _) => SourceSide::Bridge { attach, window: FillWindow::new(), monitor: BridgeMonitor::new() },
+            (None, Some(a)) => SourceSide::Capture(a),
+            (None, None) => return Err(EngineError::Thread("no source statistics".into())),
         };
-        lock(&sh.status).keepalive_note = keepalive_note;
+        let (bridge_source, loop_header) = match &src {
+            SourceSide::Bridge { attach, .. } => (Some(attach.source()), Some(attach.raw())),
+            SourceSide::Capture(_) => (None, None),
+        };
+        // Post-EQ loopback feeder (Component 3): a small in-process SPSC is pushed inside
+        // the Yamaha callback after `EqProcessor`; this non-RT thread drains it, resamples
+        // Yamaha rate -> negotiated rate with a PI drift controller on the ring-B fill and
+        // pushes into the shm ring. The thread starts before the driver does, so its silence
+        // pre-fill lands before the first `ring_b_pop`.
+        let (loopback_tap, loopback_feeder) = if let (Some(hdr), true) = (loop_header, cfg.bridge.loopback_enabled) {
+            let ltarget = bridge::loopback_target_frames(safety_ms, bridge_buffer, cable_rate);
+            let (prod, cons) = ring::channel(bridge::TAP_RING_FRAMES);
+            let feeder = bridge::spawn_loopback(hdr, cons, asio_rate, cable_rate, ltarget, cfg.resampler_quality)
+                .map_err(|e| EngineError::Thread(format!("loopback feeder: {e}")))?;
+            (Some(prod), Some(feeder))
+        } else {
+            (None, None)
+        };
 
         let mut session = Session {
             driver: Some(driver),
             buffers_created: false,
             streaming: false,
-            capture,
-            keepalive,
-            keepalive_status,
             synth: synth_handle,
             watchdog: None,
             cfg_watcher: None,
@@ -855,32 +782,32 @@ impl Session {
                 asio_rate,
                 buffer,
                 capture_period: period,
-                capture_device: ep_name.clone(),
-                capture_requested: requested,
-                period_requested: plan.requested_period_frames,
+                source_name: ep_name.clone(),
                 outputs,
                 ring_capacity,
             },
             caps: caps.clone(),
             started: Instant::now(),
-            arrival,
+            src,
+            loopback: loopback_feeder,
             planner: HeadroomPlanner::new(0, 0),
             learn_started: None,
             measured: if sh.opts.load_measured { MeasuredLatency::load_default() } else { MeasuredLatency::default() },
         };
 
         // Pipeline.
-        // Start-up headroom: the learned margin if there is one, else the conservative two packets
-        // (the former fixed burst rule); the status tick then measures and ramps it down.
-        let learned =
-            (f64::from(cfg.jitter_margin_for(&cfg.capture_device)) * f64::from(cable_rate) / 1000.0).ceil() as usize;
-        // Fixed-period capture of a virtual cable delivers small regular packets: start at 1.5 x period
-        // instead of the two-packet burst of the Hi-Fi Cable (see `initial_headroom_frames`).
-        let fixed = mode_in_use == Some(wasapi_capture::CaptureMode::FixedPeriod);
+        // Start-up headroom: the learned margin if there is one, else the conservative two packets;
+        // the status tick then measures and ramps it down.
+        let learned = (f64::from(cfg.jitter_margin_for()) * f64::from(cable_rate) / 1000.0).ceil() as usize;
         let start_headroom =
-            if learned > 0 { learned.max(min_headroom_frames(period)) } else { initial_headroom_frames(period, fixed) };
+            if learned > 0 { learned.max(min_headroom_frames(period)) } else { initial_headroom_frames(period, false) };
         session.planner = HeadroomPlanner::new(start_headroom, learned);
-        let target = plan_target(safety_ms, buffer, cable_rate, asio_rate, start_headroom as u32);
+        let mut target = plan_target(safety_ms, buffer, cable_rate, asio_rate, start_headroom as u32);
+        if is_bridge {
+            // Same floor the status tick applies (`[bridge] ring_target_ms`).
+            let floor_ms = f32::from_bits(sh.bridge_target_ms.load(Relaxed));
+            target = bridge::apply_ring_target_floor(target, floor_ms, cable_rate);
+        }
         let matcher = RateMatcher::new(RateMatcherConfig::new(cable_rate, asio_rate, target, cfg.resampler_quality));
         drop(sh.handoff.take()); // stale snapshot from before this start
         let eq = EqProcessor::new(f64::from(asio_rate), cfg, n_out as usize, sh.handoff.clone());
@@ -890,8 +817,15 @@ impl Session {
         live.target_frames.store(target as u32, Relaxed);
         live.open_bias.store(open_bias(start_headroom), Relaxed);
         sh.n_out.store(n_out as u32, Relaxed);
+        let source = match bridge_source {
+            Some(s) => PipelineSource::Bridge(s),
+            None => match consumer {
+                Some(c) => PipelineSource::Local(c),
+                None => return Err(EngineError::Thread("pipeline source missing".into())),
+            },
+        };
         let pipe = Pipeline::new(PipelineInit {
-            consumer,
+            source,
             matcher,
             eq,
             frames: buffer as usize,
@@ -904,6 +838,12 @@ impl Session {
             quality: cfg.resampler_quality,
             tap_resample: tap_rs,
             tap_eq,
+            // Source-side tap: feeds the latency probe's capture detector, the baseline
+            // monitor and the `capture_in.wav` dump with every block popped from ring A
+            // (or the synthetic ring) — only while armed / monitoring, no extra work else.
+            source_probe: sh.probe.clone(),
+            source_tap: tap_cap,
+            loopback: loopback_tap,
         });
         let ptrs = Arc::new(PtrTable::default());
         let out = OutputSet { ptrs: ptrs.clone(), types };
@@ -994,6 +934,12 @@ impl Session {
         .ok();
         session.cfg_watcher =
             ConfigWatcher::spawn(sh.opts.config_path.clone(), sh.handoff.clone(), n_out as usize, live.asio_rate.clone());
+        if is_bridge {
+            // There is no capture thread in bridge mode: the watchdog must not expect its
+            // heartbeat. A stalled driver heartbeat is a *source gap* and is handled by the
+            // existing fade/gate-rearm path (silence until the beat resumes), not by a restart.
+            heartbeat.set_capture_expected(false);
+        }
 
         drv.start().map_err(|e| asio_err("start", e))?;
         session.streaming = true;
@@ -1078,26 +1024,15 @@ fn control_loop(sh: &Arc<Shared>, rx: &Receiver<Cmd>, tx: &Sender<Cmd>, ready: &
     let mut auto = AutoSafety::default();
     let mut first = true;
     let mut holders_seen = HolderTracker::default();
-    // Persists across restarts: set once fixed-period capture was abandoned (until the capture
-    // device / period changes), so a corrupting source is reopened in Shared exactly once.
-    let mut fallback = FallbackState::default();
     loop {
         if !lock(&sh.status).state.is_waiting() {
             sh.set_state(EngineState::Starting);
         }
         let cfg = lock(&sh.config).clone();
-        if sh.reset_fallback_req.swap(false, Relaxed) {
-            fallback.reset();
-            lock(&sh.status).capture_fallback = None;
-        }
-        if fallback.note_config(&cfg) {
-            rlog!(Level::Info, "capture source settings changed: fixed-period capture is allowed again");
-            lock(&sh.status).capture_fallback = None;
-        }
         let base = cfg.safety_buffer_ms;
         auto.new_stream(t0.elapsed());
         let safety = if cfg.safety_buffer_auto { (base + auto.extra_ms()).min(crate::logic::MAX_SAFETY_MS) } else { base };
-        match Session::open(sh, &cfg, tx, safety, &fallback) {
+        match Session::open(sh, &cfg, tx, safety) {
             Ok(mut sess) => {
                 if first {
                     first = false;
@@ -1109,11 +1044,10 @@ fn control_loop(sh: &Arc<Shared>, rx: &Receiver<Cmd>, tx: &Sender<Cmd>, ready: &
                     st.peak_in_db = [-200.0; 2];
                     st.peak_out_db = [-200.0; 2];
                     st.last_error = None;
-                    st.capture_error = None;
                     st.busy_holders.clear();
                 }
                 holders_seen.reset();
-                let end = run_session(sh, rx, &mut sess, &mut auto, t0, &mut fallback);
+                let end = run_session(sh, rx, &mut sess, &mut auto, t0);
                 let uptime = sess.started.elapsed();
                 drop(sess);
                 backoff.note_run_ended(uptime);
@@ -1210,7 +1144,6 @@ fn run_session(
     sess: &mut Session,
     auto: &mut AutoSafety,
     t0: Instant,
-    fallback: &mut FallbackState,
 ) -> RunEnd {
     let mut stalls = StallTracker::default();
     let mut next_tick = Instant::now() + TICK;
@@ -1248,45 +1181,7 @@ fn run_session(
             return RunEnd::Restart(reset_reason_text(live.reset_reason.load(Relaxed)).to_string());
         }
         if let Some(i) = stalls.due(now) {
-            return RunEnd::Restart(if i == 0 { "audio callback stalled" } else { "capture stalled" }.to_string());
-        }
-        if let Some(cap) = sess.capture.as_ref() {
-            while let Ok(ev) = cap.events().try_recv() {
-                match ev {
-                    CaptureEvent::Started { .. } => {}
-                    CaptureEvent::Fallback { requested, using, reason } => {
-                        rlog!(Level::Warn, "capture fallback {requested:?} -> {using:?}: {reason}");
-                        let msg = format!("Capture mode {} -> {}: {reason}", requested.name(), using.name());
-                        let mut st = lock(&sh.status);
-                        st.capture_note = Some(match st.capture_note.take() {
-                            Some(old) if !old.is_empty() => format!("{old} {msg}"),
-                            _ => msg,
-                        });
-                    }
-                    CaptureEvent::DeviceLost => {
-                        return RunEnd::Restart("capture device lost".to_string());
-                    }
-                    CaptureEvent::Error(e) => {
-                        lock(&sh.status).capture_error = Some(e.clone());
-                        return RunEnd::Restart(format!("capture error: {e}"));
-                    }
-                    // The monitor stopped a fixed-period capture: restart ONCE in plain Shared and tell the user.
-                    CaptureEvent::Corruption(r) => match fallback.on_corruption(cap.mode_in_use(), &r.to_string()) {
-                        CorruptionAction::RestartInShared(note) => {
-                            rlog!(Level::Warn, "{note}");
-                            lock(&sh.status).capture_fallback = Some(note.clone());
-                            return RunEnd::Restart(note);
-                        }
-                        CorruptionAction::Ignore => {
-                            rlog!(Level::Warn, "capture corruption reported in {:?}: {r} (no restart)", cap.mode_in_use());
-                            lock(&sh.status).capture_error = Some(format!("capture corruption: {r}"));
-                        }
-                    },
-                }
-            }
-            if !cap.is_running() {
-                return RunEnd::Restart("capture thread ended".to_string());
-            }
+            return RunEnd::Restart(if i == 0 { "audio callback stalled" } else { "source stalled" }.to_string());
         }
         let t = Instant::now();
         if t >= next_file {
@@ -1297,6 +1192,9 @@ fn run_session(
                     last_mtime = m;
                     if m.is_some() {
                         if let Ok(c) = Config::load(p) {
+                            if let Some(n) = eq_core::take_deprecation_notice() {
+                                rlog!(Level::Warn, "{n}");
+                            }
                             let rate = live.asio_rate.load(Relaxed);
                             // EQ-class changes are published by the ConfigWatcher; only
                             // restart-class ones need action here.
@@ -1310,7 +1208,9 @@ fn run_session(
         }
         if t >= next_tick {
             next_tick = t + TICK;
-            tick(sh, sess, auto, now, &mut last_target);
+            if let Some(reason) = tick(sh, sess, auto, now, &mut last_target) {
+                return RunEnd::Restart(reason);
+            }
         }
     }
 }
@@ -1321,7 +1221,11 @@ fn open_bias(headroom: usize) -> u32 {
 }
 
 /// 100 ms status publisher + auto safety buffer + measured-headroom planner + "Learn".
-fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Duration, last_target: &mut u32) {
+///
+/// Returns a restart reason when the bridge reports a negotiated-format change (VBMatrix
+/// master/rate switch) so the next session re-derives the source rate instead of feeding
+/// the resampler a stale ratio.
+fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Duration, last_target: &mut u32) -> Option<String> {
     let live = &sh.live;
     let i = &sess.info;
     // Auto safety.
@@ -1332,9 +1236,46 @@ fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Durati
     } else {
         base
     };
-    // Measured arrival model -> jitter headroom (see `router_core::arrival`).
     let callbacks = live.callbacks.load(Relaxed);
-    let snap = sess.arrival.snapshot();
+    // Source statistics: ring-fill dips + driver liveness (bridge) or the WASAPI arrival
+    // model (synthetic measurements). The bridge branch also bumps `app_beat` every tick.
+    let mut restart: Option<String> = None;
+    let mut bv: Option<BridgeTick> = None;
+    let snap = match &mut sess.src {
+        SourceSide::Capture(arrival) => arrival.snapshot(),
+        SourceSide::Bridge { attach, window, monitor } => {
+            let h = attach.header();
+            h.app_beat.fetch_add(1, Relaxed);
+            // Format change (VBMatrix master switch): restart so the RateMatcher re-derives
+            // the source rate. Unpublished/invalid values are ignored — the values published
+            // at driver init persist for the lifetime of the mapping.
+            if let Ok((rate, buf)) = attach.negotiated() {
+                if rate != i.cable_rate || buf != i.capture_period {
+                    restart = Some(format!("bridge format changed to {rate} Hz / {buf} frames"));
+                }
+            }
+            let min = live.fill_min_tick.swap(u32::MAX, Relaxed);
+            let mean = f32::from_bits(live.fill_mean.load(Relaxed));
+            let sample =
+                monitor.sample(h.driver_running.load(Ordering::Acquire), h.driver_beat.load(Ordering::Acquire), now);
+            // One fill-dip sample per healthy tick; a silent/gated tick or a stalled beat
+            // (source gap) is left out — the fault path fades via underruns, not statistics.
+            if min != u32::MAX && mean > 0.0 && sample.beat_delta > 0 && restart.is_none() {
+                window.push((mean - min as f32).max(0.0) as u32, sample.beat_delta);
+            }
+            bv = Some(BridgeTick {
+                sample,
+                fill_a: h.fill_a() as u32,
+                fill_b: h.fill_b() as u32,
+                a_overruns: h.a_overruns(),
+                a_discarded: h.a_discarded(),
+                b_underruns: h.b_underruns(),
+                b_dropped: h.b_dropped(),
+            });
+            window.snapshot(f64::from(i.cable_rate.max(1)), i.capture_period)
+        }
+    };
+    // Measured fill/arrival statistics -> jitter headroom (see `router_core::arrival`).
     let params = HeadroomParams { period_frames: i.capture_period, cap_frames: MAX_PERIOD_FRAMES };
     let required = required_headroom_frames(&snap, &params);
     let learned_floor =
@@ -1344,7 +1285,12 @@ fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Durati
     // Lower only once the drift controller has pulled the mean fill up to the current target.
     let may_lower = callbacks > 300 && mean_fill + 64.0 >= *last_target as f32;
     let headroom = sess.planner.update(now.as_secs_f64(), &snap, &params, may_lower);
-    let target = plan_target(safety, i.buffer, i.cable_rate, i.asio_rate, headroom as u32) as u32;
+    let mut target = plan_target(safety, i.buffer, i.cable_rate, i.asio_rate, headroom as u32) as u32;
+    if bv.is_some() {
+        // `[bridge] ring_target_ms` acts as a floor on the derived target (hot-applied).
+        let floor_ms = f32::from_bits(sh.bridge_target_ms.load(Relaxed));
+        target = bridge::apply_ring_target_floor(target as usize, floor_ms, i.cable_rate) as u32;
+    }
     if target != *last_target {
         live.target_frames.store(target, Relaxed);
         live.open_bias.store(open_bias(headroom), Relaxed);
@@ -1352,13 +1298,20 @@ fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Durati
     }
     // "Learn (30 s)".
     if sh.learn_req.swap(false, Relaxed) && sess.learn_started.is_none() {
-        sess.arrival.request_reset();
+        match &mut sess.src {
+            SourceSide::Capture(a) => a.request_reset(),
+            SourceSide::Bridge { window, .. } => window.clear(),
+        }
         sess.planner.note_reset();
         sess.learn_started = Some(now);
         let mut st = lock(&sh.status);
         let prev = st.learn.clone();
         st.learn = LearnStatus { active: true, progress_s: 0.0, total_s: LEARN_SECS as f32, error: None, ..prev };
-        rlog!(Level::Info, "learn: measuring capture arrival jitter for {LEARN_SECS} s");
+        let what = match &sess.src {
+            SourceSide::Capture(_) => "capture arrival jitter",
+            SourceSide::Bridge { .. } => "bridge ring-fill dips",
+        };
+        rlog!(Level::Info, "learn: measuring {what} for {LEARN_SECS} s");
     }
     if let Some(t0) = sess.learn_started {
         let el = now.saturating_sub(t0).as_secs_f64();
@@ -1368,13 +1321,17 @@ fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Durati
             sess.learn_started = None;
             st.learn.active = false;
             st.learn.finished += 1;
-            if snap.events >= LEARN_MIN_EVENTS {
+            let (min_events, is_bridge) = match &sess.src {
+                SourceSide::Bridge { .. } => (LEARN_MIN_TICKS, true),
+                SourceSide::Capture(_) => (LEARN_MIN_EVENTS, false),
+            };
+            if snap.events >= min_events {
                 let ms = required as f64 * 1000.0 / f64::from(i.cable_rate.max(1));
                 st.learn.result_ms = Some(((ms * 10.0).ceil() / 10.0) as f32);
                 st.learn.error = None;
                 rlog!(
                     Level::Info,
-                    "learn: {} events, dip p99.9 {} fr, gap p99.9 {:.1} ms -> headroom {} fr ({ms:.1} ms)",
+                    "learn: {} samples, dip p99.9 {} fr, gap p99.9 {:.1} ms -> headroom {} fr ({ms:.1} ms)",
                     snap.events,
                     snap.dip_p999,
                     snap.gap_p999_ms(),
@@ -1382,8 +1339,11 @@ fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Durati
                 );
             } else {
                 st.learn.result_ms = None;
-                st.learn.error =
-                    Some(format!("only {} capture events in {LEARN_SECS} s: is audio playing into the cable?", snap.events));
+                st.learn.error = Some(if is_bridge {
+                    format!("only {} ring-fill samples in {LEARN_SECS} s: is the VBMatrix slot running?", snap.events)
+                } else {
+                    format!("only {} capture events in {LEARN_SECS} s: is audio playing into the cable?", snap.events)
+                });
                 rlog!(Level::Warn, "learn failed: {:?}", st.learn.error);
             }
         }
@@ -1402,23 +1362,23 @@ fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Durati
     let staleness_ms = if snap.events >= 50 { snap.staleness_s * 1000.0 } else { period_ms / 2.0 };
     let mut caps = sess.caps.clone();
     caps.sample_rate = i.asio_rate;
-    let mode_in_use = sess.capture.as_ref().map(|c| c.mode_in_use());
-    let cap_stats = sess.capture.as_ref().map(|c| c.stats().snapshot());
     if let Some(sw) = &sess.status_writer {
         sw.set_safety_buffer_us((safety * 1000.0) as u32);
         sw.set_dropped_logs(Logger::dropped());
+        sw.set_bridge(&BridgeReport {
+            attached: bv.is_some() as u32,
+            vbmatrix_running: bv.as_ref().is_some_and(|b| b.sample.vbmatrix_running) as u32,
+            sample_rate: if bv.is_some() { i.cable_rate } else { 0 },
+            buffer_frames: if bv.is_some() { i.capture_period } else { 0 },
+            fill_a: bv.as_ref().map_or(0, |b| b.fill_a),
+            fill_b: bv.as_ref().map_or(0, |b| b.fill_b),
+            a_overruns: sat_u32(bv.as_ref().map_or(0, |b| b.a_overruns)),
+            a_discarded: sat_u32(bv.as_ref().map_or(0, |b| b.a_discarded)),
+            b_underruns: sat_u32(bv.as_ref().map_or(0, |b| b.b_underruns)),
+            b_dropped: sat_u32(bv.as_ref().map_or(0, |b| b.b_dropped)),
+        });
     }
     sh.handoff.collect();
-    // A keep-alive whose render endpoint went away is dropped (non-fatal).
-    let mut ka_note = None;
-    if sess.keepalive.as_ref().is_some_and(|k| k.is_lost() || !k.is_running()) {
-        if let Some(mut k) = sess.keepalive.take() {
-            k.stop();
-        }
-        sess.keepalive_status = None;
-        ka_note = Some("Render keep-alive stopped: its render endpoint was lost.".to_string());
-        rlog!(Level::Warn, "render keep-alive stopped (endpoint lost)");
-    }
     let cfg_err = sess.cfg_watcher.as_ref().and_then(|w| w.last_error());
     let mut st = lock(&sh.status);
     st.master_name = i.master_name.clone();
@@ -1445,23 +1405,10 @@ fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Durati
         _ => FaultState::Muted,
     };
     st.non_finite = live.non_finite.load(Relaxed);
-    st.capture_mode_requested = Some(i.capture_requested);
-    st.capture_mode_in_use = mode_in_use;
-    st.capture_device = i.capture_device.clone();
+    st.source_name = i.source_name.clone();
     st.capture_period_frames = i.capture_period;
-    st.capture_period_frames_granted = i.capture_period;
-    st.capture_period_frames_requested = i.period_requested;
-    st.keepalive = sess.keepalive_status.clone();
-    if ka_note.is_some() {
-        st.keepalive_note = ka_note;
-    }
     st.capture_period_us = (period_ms * 1000.0) as u32;
     st.capture_burst_max_frames = live.burst_max.load(Relaxed);
-    if let Some(cs) = cap_stats {
-        st.capture_packets = cs.packets;
-        st.capture_discontinuities = cs.discontinuities;
-        st.capture_silent_packets = cs.silent_packets;
-    }
     st.cpu_avg_us = avg;
     st.cpu_max_us = max;
     st.cpu_avg_pct = cpu_percent(f64::from(avg), period_us) as f32;
@@ -1471,10 +1418,9 @@ fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Durati
     st.safety_buffer_ms = safety;
     let render_side = sess.measured.render_side(
         &EngineParams {
-            capture_device: i.capture_device.clone(),
+            source: eq_core::BRIDGE_SOURCE_KEY.to_string(),
             asio_buffer: i.buffer,
             capture_period_frames: i.capture_period,
-            keepalive: sess.keepalive_status.is_some(),
         },
         eq_core::now_unix_s(),
     );
@@ -1489,7 +1435,39 @@ fn tick(sh: &Arc<Shared>, sess: &mut Session, auto: &mut AutoSafety, now: Durati
     st.hardening = HardeningReport::current(live.mmcss_asio.load(Relaxed));
     st.config_error = cfg_err;
     st.dropped_logs = Logger::dropped();
+    match &bv {
+        Some(b) => {
+            st.bridge_attached = true;
+            st.vbmatrix_running = b.sample.vbmatrix_running;
+            st.bridge_sample_rate = i.cable_rate;
+            st.bridge_buffer_frames = i.capture_period;
+            st.fill_a = b.fill_a;
+            st.fill_b = b.fill_b;
+            st.a_overruns = b.a_overruns;
+            st.a_discarded = b.a_discarded;
+            st.b_underruns = b.b_underruns;
+            st.b_dropped = b.b_dropped;
+        }
+        None => {
+            st.bridge_attached = false;
+            st.vbmatrix_running = false;
+            st.bridge_sample_rate = 0;
+            st.bridge_buffer_frames = 0;
+            st.fill_a = 0;
+            st.fill_b = 0;
+            st.a_overruns = 0;
+            st.a_discarded = 0;
+            st.b_underruns = 0;
+            st.b_dropped = 0;
+        }
+    }
     st.uptime_ms = sess.started.elapsed().as_millis() as u64;
+    restart
+}
+
+/// u64 -> u32 saturation for the status block counters.
+fn sat_u32(v: u64) -> u32 {
+    v.min(u64::from(u32::MAX)) as u32
 }
 
 #[cfg(test)]
@@ -1500,32 +1478,6 @@ mod tests {
 
     /// The engine owns a process-wide named mutex, so engine tests must not overlap.
     static SERIAL: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn keepalive_period_conversion_and_guard() {
-        assert_eq!(period_ms(Some((48, 48000))), Some(1.0));
-        assert_eq!(period_ms(Some((480, 48000))), Some(10.0));
-        assert_eq!(period_ms(Some((480, 0))), None);
-        assert_eq!(period_ms(None), None);
-        // off by default; never started on a real output device (no endpoint is touched)
-        let cfg = Config::default();
-        assert!(start_keepalive(&cfg, "Line 1 (Virtual Audio Cable)").0.is_none());
-        let on = Config { render_keepalive: true, ..Config::default() };
-        let (k, st, note) = start_keepalive(&on, "Speakers (Realtek(R) Audio)");
-        assert!(k.is_none() && st.is_none());
-        assert!(note.unwrap().contains("not a known virtual cable"));
-    }
-
-    #[test]
-    fn exclusive_is_mapped_to_shared_with_note() {
-        use eq_core::CaptureMode as C;
-        use wasapi_capture::CaptureMode as W;
-        assert_eq!(effective_capture_mode(C::Shared), (W::Shared, None));
-        assert_eq!(effective_capture_mode(C::LowLatency), (W::LowLatency, None));
-        let (m, note) = effective_capture_mode(C::Exclusive);
-        assert_eq!(m, W::Shared);
-        assert!(note.is_some_and(|n| n.contains("Exclusive") && n.contains("Shared")));
-    }
 
     #[test]
     fn busy_master_waits_and_retries() {
@@ -1545,7 +1497,6 @@ mod tests {
             publish_caps: false,
             status_mapping: false,
             tap: None,
-            cable_formats: None,
             synthetic: None,
             retry_unavailable: false,
             loopback_probe: None,
@@ -1583,7 +1534,6 @@ mod tests {
             publish_caps: false,
             status_mapping: false,
             tap: None,
-            cable_formats: None,
             synthetic: None,
             retry_unavailable: retry,
             loopback_probe: None,

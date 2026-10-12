@@ -1,19 +1,8 @@
 //! Live engine status, meters and errors.
 
 use crate::app::{state_label, App, AMBER, GREEN, RED};
-use crate::logic::{self, meter_fraction, ring_gauge};
+use crate::logic::{meter_fraction, ring_gauge};
 use eq_core::FaultState;
-use wasapi_capture::CaptureMode as WMode;
-
-fn mode_name(m: Option<WMode>) -> &'static str {
-    match m {
-        Some(WMode::Shared) => "Shared",
-        Some(WMode::LowLatency) => "Low-latency",
-        Some(WMode::Exclusive) => "Exclusive",
-        Some(WMode::FixedPeriod) => "Fixed period",
-        None => "-",
-    }
-}
 
 fn count(ui: &mut egui::Ui, v: u64) {
     if v > 0 {
@@ -32,7 +21,6 @@ pub fn ui(ui: &mut egui::Ui, app: &App) {
         return;
     };
 
-    crate::panels::source::fallback_banner(ui, app);
     let (ftext, fcolor) = match s.fault {
         FaultState::Ok => ("Ok", GREEN),
         FaultState::Warn => ("Warn", AMBER),
@@ -57,7 +45,7 @@ pub fn ui(ui: &mut egui::Ui, app: &App) {
         ui.label(&s.master_name);
         ui.end_row();
         ui.label("Rates");
-        ui.label(format!("cable {} Hz / Yamaha {} Hz", s.cable_rate, s.asio_rate));
+        ui.label(format!("source {} Hz / Yamaha {} Hz", s.cable_rate, s.asio_rate));
         ui.end_row();
         ui.label("Buffer");
         ui.label(format!("{} frames", s.buffer_size));
@@ -86,27 +74,20 @@ pub fn ui(ui: &mut egui::Ui, app: &App) {
         ui.label("Callback");
         ui.label(format!("avg {:.0} us / max {:.0} us", s.cpu_avg_us, s.cpu_max_us));
         ui.end_row();
-        ui.label("Capture mode");
-        ui.label(format!(
-            "{} (requested {})",
-            mode_name(s.capture_mode_in_use),
-            mode_name(s.capture_mode_requested)
-        ));
-        ui.end_row();
-        ui.label("Capture period");
-        ui.label(logic::period_status_text(
-            s.capture_period_frames_requested,
-            s.capture_period_frames_granted,
-            s.cable_rate,
-        ));
-        ui.end_row();
-        if let Some(k) = &s.keepalive {
-            ui.label("Keep-alive");
-            ui.label(logic::keepalive_text(k));
+        if s.bridge_attached {
+            ui.label("Bridge");
+            ui.label(format!(
+                "{} {} Hz / {} fr, ring A {} / ring B {}",
+                if s.vbmatrix_running { "running" } else { "idle" },
+                s.bridge_sample_rate,
+                s.bridge_buffer_frames,
+                s.fill_a,
+                s.fill_b
+            ));
             ui.end_row();
         }
-        ui.label("Largest burst");
-        ui.label(format!("{} frames", s.capture_burst_max_frames));
+        ui.label("Source period");
+        ui.label(crate::logic::frames_ms_text(s.capture_period_frames, s.cable_rate));
         ui.end_row();
         ui.label("Ring fill");
         ui.label(format!(
@@ -114,7 +95,7 @@ pub fn ui(ui: &mut egui::Ui, app: &App) {
             s.ring_mean_fill_frames, s.ring_target_frames, s.jitter_headroom_frames, s.required_headroom_frames
         ));
         ui.end_row();
-        ui.label("Arrival (p99.9)");
+        ui.label("Fill stats (p99.9)");
         ui.label(format!(
             "gap {:.1} ms, dip {} fr, staleness {:.1} ms ({:.0} s)",
             s.arrival_gap_p999_ms, s.arrival_dip_p999_frames, s.capture_staleness_ms, s.arrival_observed_s
@@ -132,16 +113,18 @@ pub fn ui(ui: &mut egui::Ui, app: &App) {
             }
         });
         ui.end_row();
-        ui.label("Capture packets");
-        ui.label(format!(
-            "{} ({} flagged discontinuity, {} silent)",
-            s.capture_packets, s.capture_discontinuities, s.capture_silent_packets
-        ));
-        ui.end_row();
         ui.label("Uptime");
         let secs = s.uptime_ms / 1000;
         ui.label(format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60));
         ui.end_row();
+        if s.bridge_attached {
+            ui.label("Ring counters");
+            ui.label(format!(
+                "A over {} / discard {}, B under {} / drop {}",
+                s.a_overruns, s.a_discarded, s.b_underruns, s.b_dropped
+            ));
+            ui.end_row();
+        }
         ui.label("Restarts");
         ui.label(s.restarts.to_string());
         ui.end_row();
@@ -153,15 +136,7 @@ pub fn ui(ui: &mut egui::Ui, app: &App) {
     meter(ui, "Out L", s.peak_out_db[0]);
     meter(ui, "Out R", s.peak_out_db[1]);
 
-    if let Some(n) = &s.capture_note {
-        ui.add_space(4.0);
-        ui.colored_label(AMBER, n);
-    }
-    if let Some(n) = &s.keepalive_note {
-        ui.add_space(4.0);
-        ui.colored_label(AMBER, n);
-    }
-    let errors = [("Error", &s.last_error), ("Capture", &s.capture_error), ("Config", &s.config_error)];
+    let errors = [("Error", &s.last_error), ("Config", &s.config_error)];
     if errors.iter().any(|(_, e)| e.is_some()) {
         ui.add_space(4.0);
         ui.strong("Errors");

@@ -34,7 +34,7 @@ pub enum ConfigChange {
     Unchanged,
     /// EQ / bypass / limiter / headroom / safety buffer / resampler quality: live.
     HotApply,
-    /// Master driver, sample rate, capture device/mode or output channels: restart.
+    /// Master driver, sample rate, output channels or the bridge loopback toggle: restart.
     NeedsRestart(&'static str),
 }
 
@@ -51,24 +51,13 @@ pub fn classify_change(old: &Config, new: &Config, effective_rate: u32) -> Confi
             return ConfigChange::NeedsRestart("sample rate changed");
         }
     }
-    if !old.capture_device.eq_ignore_ascii_case(&new.capture_device) {
-        return ConfigChange::NeedsRestart("capture device changed");
-    }
-    if old.capture_mode != new.capture_mode {
-        return ConfigChange::NeedsRestart("capture mode changed");
-    }
-    if (old.capture_period_ms - new.capture_period_ms).abs() > 1e-4 {
-        return ConfigChange::NeedsRestart("capture period changed");
-    }
-    if old.render_keepalive != new.render_keepalive {
-        return ConfigChange::NeedsRestart("render keep-alive changed");
-    }
     if old.output_channels != new.output_channels {
         return ConfigChange::NeedsRestart("output channels changed");
     }
-    if !old.match_cable_rate && new.match_cable_rate {
-        return ConfigChange::NeedsRestart("cable rate matching enabled");
+    if old.bridge.loopback_enabled != new.bridge.loopback_enabled {
+        return ConfigChange::NeedsRestart("bridge loopback changed");
     }
+    // `bridge.ring_target_ms` is applied live (the status tick re-derives the target).
     if old == new {
         ConfigChange::Unchanged
     } else {
@@ -378,30 +367,22 @@ mod tests {
             assert_eq!(classify_change(&base, &c, 48000), ConfigChange::HotApply);
         }
 
-        // source settings: the preset label and learned margins are live, period / keep-alive restart
-        for f in [
-            |c: &mut Config| c.source_preset = eq_core::SourcePreset::Custom,
-            |c: &mut Config| c.set_jitter_margin(5.0),
-        ] {
-            let mut c = base.clone();
-            f(&mut c);
-            assert_eq!(classify_change(&base, &c, 48000), ConfigChange::HotApply);
-        }
+        // learned margins are live (the floor is re-read on the next status tick)
         let mut c = base.clone();
-        c.capture_period_ms = 6.0;
-        assert_eq!(classify_change(&base, &c, 48000), ConfigChange::NeedsRestart("capture period changed"));
+        c.set_jitter_margin(5.0);
+        assert_eq!(classify_change(&base, &c, 48000), ConfigChange::HotApply);
+        // bridge: the loopback toggle restarts (feeder thread is session-scoped),
+        // the ring-target floor is hot (re-derived on the next 100 ms tick).
         let mut c = base.clone();
-        c.render_keepalive = true;
-        assert_eq!(classify_change(&base, &c, 48000), ConfigChange::NeedsRestart("render keep-alive changed"));
-        let mut vac = base.clone();
-        vac.apply_source_preset(eq_core::SourcePreset::Vac);
-        assert!(matches!(classify_change(&base, &vac, 48000), ConfigChange::NeedsRestart(_)));
+        c.bridge.loopback_enabled = false;
+        assert_eq!(classify_change(&base, &c, 48000), ConfigChange::NeedsRestart("bridge loopback changed"));
+        let mut c = base.clone();
+        c.bridge.ring_target_ms = 12.0;
+        assert_eq!(classify_change(&base, &c, 48000), ConfigChange::HotApply);
 
-        let restarts: [fn(&mut Config); 5] = [
+        let restarts: [fn(&mut Config); 3] = [
             |c| c.master_driver = "Other ASIO".into(),
             |c| c.sample_rate = 96000,
-            |c| c.capture_device = "CABLE Output".into(),
-            |c| c.capture_mode = eq_core::CaptureMode::Exclusive,
             |c| c.output_channels = [2, 3],
         ];
         for f in restarts {

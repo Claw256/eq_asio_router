@@ -39,9 +39,9 @@ pub use session::{
 };
 pub use monitor::{packet_fingerprint, CorruptionMonitor, CorruptionReason, MonitorConfig};
 pub use impulse::{
-    click_samples, is_sink_allowed, onset_index, qpc_hz, qpc_ticks, render_impulses, validate_peak_dbfs, ImpulseRenderOptions,
-    ImpulseRenderer, ImpulseShape, ImpulseTimes, ImpulseTrain, RenderFill, RenderInfo, RenderMode, RenderPrefill, DEFAULT_IMPULSE_DBFS,
-    MAX_IMPULSE_DBFS,
+    click_samples, is_sink_allowed, is_vbmatrix_render_name, onset_index, qpc_hz, qpc_ticks, render_impulses, validate_peak_dbfs,
+    ImpulseRenderOptions, ImpulseRenderer, ImpulseShape, ImpulseTimes, ImpulseTrain, RenderFill, RenderInfo, RenderMode,
+    RenderPrefill, DEFAULT_IMPULSE_DBFS, MAX_IMPULSE_DBFS,
 };
 pub use keepalive::{
     is_virtual_cable_name, pair_render_name, RenderKeepAlive, RenderKeepAliveInfo, RenderKeepAliveOptions,

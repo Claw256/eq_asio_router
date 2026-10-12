@@ -16,12 +16,20 @@ pub const IID_IUNKNOWN: Guid = Guid { data1: 0, data2: 0, data3: 0, data4: [0xC0
 pub const IID_ICLASSFACTORY: Guid = Guid { data1: 1, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
 
 pub const DRIVER_NAME: &str = "EQ ASIO Router";
-pub const DRIVER_DESCRIPTION: &str = "EQ ASIO Router (virtual ASIO driver with AutoEQ)";
-pub const DRIVER_VERSION: i32 = 1;
-pub const CONTROL_PANEL_EXE: &str = "eq-asio-app.exe";
+pub const DRIVER_DESCRIPTION: &str = "virtual ASIO bridge for VBMatrix";
+pub const DRIVER_VERSION: i32 = 2;
 
-/// Output channels we expose (the Bridge has 8 route buttons); 0 and 1 are the EQ pair.
+/// Channels each direction (in = out). The engine pair is 0/1; outputs 2..8
+/// are discarded after the shuttle copy and inputs 2..8 return silence.
 pub const NUM_OUTPUTS: i32 = 8;
+pub const NUM_INPUTS: i32 = 8;
+
+/// `asioMessage(K_ASIO_SELECTOR_SUPPORTED, <this>)` — EQ convention (not a
+/// Steinberg selector): a host answers 1 when it can only process buffers
+/// *deferred* (`directProcess = FALSE`, pull-style) and therefore cannot use
+/// this driver. Hosts that do not know the selector answer 0 (standard
+/// behaviour), i.e. direct processing is assumed. Rejected in `createBuffers`.
+pub const K_ASIO_DEFER_PROCESS: i32 = 0x4551_0001;
 
 pub fn guid_to_string(g: &Guid) -> String {
     format!(

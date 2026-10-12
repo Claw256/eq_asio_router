@@ -10,8 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 asio-abi.workspace = true
-asio-host.workspace = true
-eq-core.workspace = true
+bridge-abi.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -21,5 +20,6 @@ windows = { workspace = true, features = [
     "Win32_System_Memory",
     "Win32_System_Performance",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

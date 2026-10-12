@@ -1,10 +1,7 @@
 //! Pure helpers (no I/O, no egui): easy to unit-test.
 
-use eq_core::{
-    RenderBasis, is_vac_name, is_vb_cable_name, Config, LatencyBreakdown, SourcePreset, MAX_CAPTURE_PERIOD_MS, MIN_CAPTURE_PERIOD_MS,
-    RECOMMENDED_CAPTURE_PERIOD_MS,
-};
-use router_engine::{HolderInfo, KeepAliveStatus, SourceReadiness};
+use eq_core::{Config, LatencyBreakdown, RenderBasis};
+use router_engine::HolderInfo;
 use std::path::PathBuf;
 
 /// Name of the process of the VB ASIO Bridge that may hold the Yamaha.
@@ -21,7 +18,7 @@ pub fn meter_fraction(db: f32) -> f32 {
 }
 
 /// Segment widths (fractions of the bar, summing to 1 unless everything is 0)
-/// for `[Yamaha out, ring, capture, render side (measured or estimate)]`.
+/// for `[Yamaha out, ring, source staleness, render side (measured or estimate)]`.
 pub fn latency_fractions(b: &LatencyBreakdown) -> [f32; 4] {
     let parts = [b.master_out_ms, b.ring_ms, b.capture_ms, b.render_side_ms]
         .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 });
@@ -42,14 +39,14 @@ pub fn ring_gauge(fill: u32, target: u32, capacity: u32) -> f32 {
     }
 }
 
-/// Hint shown when the cable and the master run at different rates.
-pub fn rate_hint(cable: u32, master: u32) -> Option<String> {
-    if cable == 0 || master == 0 || cable == master {
+/// Hint shown when the source (VBMatrix bridge) and the master run at different rates.
+pub fn rate_hint(source: u32, master: u32) -> Option<String> {
+    if source == 0 || master == 0 || source == master {
         return None;
     }
     Some(format!(
-        "Cable is {cable} Hz, Yamaha {master} Hz: resampled in the router (extra conversion). Enable \"Match cable \
-         sample rate\" below, or set Hi-Fi Cable Input AND Output to the same rate in Windows Sound settings"
+        "Source (bridge) is {source} Hz, Yamaha {master} Hz: resampled in the router (extra conversion). Match the \
+         rates by picking the same rate for the VBMatrix slot and the engine if you want to avoid it"
     ))
 }
 
@@ -141,136 +138,8 @@ pub fn restarting_label(reason: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Source panel: presets, capture period, readiness, fallback, keep-alive
+// Shared texts (source / readiness panels were removed with the bridge cutover)
 // ---------------------------------------------------------------------------------------------
-
-/// Combo-box label of a source preset.
-pub fn preset_label(p: SourcePreset) -> &'static str {
-    match p {
-        SourcePreset::Cable => "Hi-Fi Cable (compat)",
-        SourcePreset::Vac => "VAC Line 1 (low latency)",
-        SourcePreset::Custom => "Custom",
-    }
-}
-
-/// One-paragraph description shown under the preset selector.
-pub fn preset_description(p: SourcePreset) -> &'static str {
-    match p {
-        SourcePreset::Cable => {
-            "VB-Audio Hi-Fi Cable with the driver's default 10 ms capture period. Works everywhere; highest latency."
-        }
-        SourcePreset::Vac => {
-            "Virtual Audio Cable lite \"Line 1\": 6 ms fixed capture period plus a render keep-alive. Measured \
-             sample-accurate; roughly 20 ms lower total latency. Windows default playback must be set to \"Line 1\". \
-             VAC lite is freeware for private use, 16-bit, 48 kHz only."
-        }
-        SourcePreset::Custom => "Hand-picked capture device, period and keep-alive (no preset applied).",
-    }
-}
-
-/// What switching to `to` changes (shown in the first-time confirmation).
-pub fn preset_change_summary(to: SourcePreset) -> String {
-    match to {
-        SourcePreset::Vac => "Capture device becomes \"Line 1 (Virtual Audio Cable)\" (Shared mode), the capture \
-            period is set to 6 ms (288 frames), the render keep-alive is turned on and \"Match cable sample rate\" \
-            is turned off (VAC is fixed at 48 kHz and is never touched). The engine restarts (~1-2 s). You must set \
-            Windows' default playback device to \"Line 1\" yourself."
-            .to_string(),
-        SourcePreset::Cable => "Capture device becomes \"Hi-Fi Cable Output\" (Shared mode), the capture period goes \
-            back to the driver default (10 ms), the render keep-alive is turned off and \"Match cable sample rate\" \
-            is turned on. The engine restarts (~1-2 s)."
-            .to_string(),
-        SourcePreset::Custom => "Marks the source settings as hand-edited; nothing else changes.".to_string(),
-    }
-}
-
-/// The capture-period choices offered in the UI.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PeriodChoice {
-    /// 0: driver default (Shared, 10 ms).
-    Auto,
-    /// 6 ms (288 frames): recommended.
-    Recommended,
-    /// 5 ms (240 frames): the minimum accepted value.
-    Minimum,
-    /// Any other value within MIN..=MAX.
-    Custom(f32),
-}
-
-/// Classifies a config value (`capture_period_ms`).
-pub fn period_choice(ms: f32) -> PeriodChoice {
-    if !ms.is_finite() || ms <= 0.0 {
-        PeriodChoice::Auto
-    } else if (ms - RECOMMENDED_CAPTURE_PERIOD_MS).abs() < 0.01 {
-        PeriodChoice::Recommended
-    } else if (ms - MIN_CAPTURE_PERIOD_MS).abs() < 0.01 {
-        PeriodChoice::Minimum
-    } else {
-        PeriodChoice::Custom(ms)
-    }
-}
-
-/// Label of a period choice.
-pub fn period_choice_label(c: PeriodChoice) -> String {
-    match c {
-        PeriodChoice::Auto => "Auto (driver default, 10 ms)".to_string(),
-        PeriodChoice::Recommended => "6 ms (recommended)".to_string(),
-        PeriodChoice::Minimum => "5 ms (minimum safe)".to_string(),
-        PeriodChoice::Custom(ms) => format!("Custom ({ms:.1} ms)"),
-    }
-}
-
-/// Clamps a user-entered period: 0 stays Auto, anything else is limited to MIN..=MAX (NaN -> Auto).
-pub fn clamp_period_ms(ms: f32) -> f32 {
-    if !ms.is_finite() || ms <= 0.0 {
-        0.0
-    } else {
-        ms.clamp(MIN_CAPTURE_PERIOD_MS, MAX_CAPTURE_PERIOD_MS)
-    }
-}
-
-/// Milliseconds -> frames at `rate` (shared rounding with the engine).
-pub fn ms_to_frames(ms: f32, rate: u32) -> u32 {
-    eq_core::frames_for_ms(f64::from(ms), rate)
-}
-
-/// Frames -> milliseconds at `rate` (0 for an unknown rate).
-pub fn frames_to_ms(frames: u32, rate: u32) -> f64 {
-    if rate == 0 {
-        0.0
-    } else {
-        f64::from(frames) * 1000.0 / f64::from(rate)
-    }
-}
-
-/// Plain-language explanation of the period control.
-pub const PERIOD_EXPLANATION: &str = "How often the virtual cable hands audio to the router. Smaller is lower \
-    latency but riskier: VAC Line 1 is sample-accurate at the default and at 6 ms (288 frames), but NOT at 4.5 ms or \
-    less, and 240 frames (5 ms) proved unreliable. If corruption is detected the router falls back to plain Shared \
-    (10 ms) once and tells you why.";
-
-/// Warning for risky periods.
-pub fn period_warning(c: PeriodChoice) -> Option<&'static str> {
-    match c {
-        PeriodChoice::Minimum => {
-            Some("\u{26A0} 5 ms is the lowest accepted value and proved unreliable in tests (240 frames); 6 ms is recommended.")
-        }
-        PeriodChoice::Custom(ms) if ms < RECOMMENDED_CAPTURE_PERIOD_MS => Some(
-            "\u{26A0} Below 6 ms the cable may deliver damaged audio; the router falls back to Shared if it detects that.",
-        ),
-        _ => None,
-    }
-}
-
-/// The period control only makes sense on a known virtual cable.
-pub fn is_known_virtual_cable(name: &str) -> bool {
-    is_vac_name(name) || is_vb_cable_name(name)
-}
-
-/// Explanation of the render keep-alive.
-pub const KEEPALIVE_EXPLANATION: &str = "Plays silence into the cable's playback endpoint so Windows runs it at a \
-    small engine period. This lowers Line 1's period for ALL apps rendering into it (less render-side latency) and \
-    costs a little CPU.";
 
 /// Severity of a readiness row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,70 +162,12 @@ impl Severity {
     }
 }
 
-/// One line of the readiness panel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadinessRow {
-    pub label: &'static str,
-    pub severity: Severity,
-    pub text: String,
-}
-
-fn tri(v: Option<bool>) -> Severity {
-    match v {
-        Some(true) => Severity::Ok,
-        Some(false) => Severity::Warn,
-        None => Severity::Unknown,
-    }
-}
-
-/// Rows for capture present / render present / default playback / formats.
-pub fn readiness_rows(r: &SourceReadiness, capture_device: &str) -> Vec<ReadinessRow> {
-    let cap = if r.capture_present { Severity::Ok } else { Severity::Fail };
-    let ren = if r.render_present { Severity::Ok } else { Severity::Fail };
-    let playback_name = if is_vac_name(capture_device) { "Line 1" } else { "the cable" };
-    vec![
-        ReadinessRow {
-            label: "Capture endpoint",
-            severity: cap,
-            text: if r.capture_present { "present".into() } else { "not present".into() },
-        },
-        ReadinessRow {
-            label: "Render endpoint",
-            severity: ren,
-            text: if r.render_present { "present".into() } else { "not present".into() },
-        },
-        ReadinessRow {
-            label: "Windows default playback",
-            severity: if r.render_present { tri(r.is_default_playback) } else { Severity::Unknown },
-            text: match r.is_default_playback {
-                Some(true) => format!("{playback_name} is the default playback device"),
-                Some(false) => format!("Set {playback_name} as default playback in Windows Sound settings"),
-                None => "unknown".into(),
-            },
-        },
-        ReadinessRow {
-            label: "Formats",
-            severity: tri(r.formats_ok),
-            text: match r.formats_ok {
-                Some(true) => "stereo, same rate on both endpoints".into(),
-                Some(false) => "differ or not stereo (see notes)".into(),
-                None => "unknown".into(),
-            },
-        },
-    ]
-}
-
-/// Shown when the VAC recording endpoint is absent.
-pub fn waiting_for_line1_text() -> &'static str {
-    "Waiting for Line 1 (Virtual Audio Cable)\u{2026} (the recording endpoint can appear late; the router keeps retrying)"
-}
-
-/// Banner text for a corruption fallback (the engine text already starts with the headline).
-pub fn fallback_banner_text(text: &str) -> String {
-    if text.starts_with("Capture fell back") {
-        text.to_string()
+/// Frames -> milliseconds at `rate` (0 for an unknown rate).
+pub fn frames_to_ms(frames: u32, rate: u32) -> f64 {
+    if rate == 0 {
+        0.0
     } else {
-        format!("Capture fell back to Shared (10 ms): {text}")
+        f64::from(frames) * 1000.0 / f64::from(rate)
     }
 }
 
@@ -369,30 +180,11 @@ pub fn frames_ms_text(frames: u32, rate: u32) -> String {
     }
 }
 
-/// Requested vs granted capture period.
-pub fn period_status_text(requested: u32, granted: u32, rate: u32) -> String {
-    let granted_t = frames_ms_text(granted, rate);
-    if requested == 0 {
-        format!("driver default, granted {granted_t}")
-    } else if requested == granted {
-        format!("requested {} = granted {granted_t}", frames_ms_text(requested, rate))
-    } else {
-        format!("requested {}, granted {granted_t}", frames_ms_text(requested, rate))
-    }
-}
-
-/// Keep-alive line: "Line 1: engine period 10.0 -> 1.0 ms".
-pub fn keepalive_text(k: &KeepAliveStatus) -> String {
-    let p = |v: Option<f32>| v.map_or("?".to_string(), |v| format!("{v:.1}"));
-    format!("{}: engine period {} \u{2192} {} ms", k.render_name, p(k.engine_period_before_ms), p(k.engine_period_after_ms))
-}
-
 /// Legend name of the render-side segment: says whether the figure is measured or an estimate.
 pub fn render_segment_label(b: &LatencyBreakdown) -> String {
     match b.render_basis {
         RenderBasis::Measured { unix_s } => format!("Render side (measured {})", eq_core::date_from_unix(unix_s)),
         RenderBasis::Estimate => "Render side (estimate, not measured)".to_string(),
-        RenderBasis::EstimateCable => "Render side (typical for this driver, not measured)".to_string(),
     }
 }
 
@@ -412,23 +204,13 @@ pub fn render_side_text(b: &LatencyBreakdown, now_unix_s: u64) -> String {
     }
 }
 
-/// Label of the capture segment of the latency bar, aware of the capture mode in use.
-pub fn capture_segment_label(fixed_period: bool) -> &'static str {
-    if fixed_period {
-        "Capture (fixed period, staleness)"
-    } else {
-        "Capture (staleness)"
-    }
-}
-
-/// Which device the learned margin belongs to and its value.
+/// What the learned margin is and its value.
 pub fn learned_margin_text(cfg: &Config) -> String {
-    let dev = if cfg.capture_device.trim().is_empty() { "(no device)" } else { cfg.capture_device.trim() };
-    let ms = cfg.jitter_margin_for(&cfg.capture_device);
+    let ms = cfg.jitter_margin_for();
     if ms > 0.0 {
-        format!("learned margin {ms:.1} ms for {dev}")
+        format!("learned margin {ms:.1} ms for the bridge source")
     } else {
-        format!("not learned for {dev} (automatic)")
+        "not learned for the bridge source (automatic)".to_string()
     }
 }
 
@@ -437,92 +219,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn presets_and_period() {
-        assert!(preset_label(SourcePreset::Vac).contains("VAC"));
-        assert!(preset_description(SourcePreset::Vac).contains("freeware"));
-        assert!(preset_change_summary(SourcePreset::Vac).contains("keep-alive"));
-        assert!(preset_change_summary(SourcePreset::Cable).contains("Hi-Fi Cable Output"));
-        assert_eq!(period_choice(0.0), PeriodChoice::Auto);
-        assert_eq!(period_choice(f32::NAN), PeriodChoice::Auto);
-        assert_eq!(period_choice(6.0), PeriodChoice::Recommended);
-        assert_eq!(period_choice(5.0), PeriodChoice::Minimum);
-        assert_eq!(period_choice(7.5), PeriodChoice::Custom(7.5));
-        assert!(period_choice_label(PeriodChoice::Recommended).contains("recommended"));
-        assert!(period_choice_label(PeriodChoice::Custom(7.5)).contains("7.5"));
-        assert_eq!(clamp_period_ms(0.0), 0.0);
-        assert_eq!(clamp_period_ms(1.0), 5.0);
-        assert_eq!(clamp_period_ms(99.0), 20.0);
-        assert_eq!(clamp_period_ms(f32::NAN), 0.0);
-        assert_eq!(ms_to_frames(6.0, 48000), 288);
-        assert_eq!(ms_to_frames(5.0, 48000), 240);
-        assert!((frames_to_ms(288, 48000) - 6.0).abs() < 1e-9);
-        assert_eq!(frames_to_ms(288, 0), 0.0);
-        assert!(period_warning(PeriodChoice::Minimum).is_some());
-        assert!(period_warning(PeriodChoice::Custom(5.5)).is_some());
-        assert!(period_warning(PeriodChoice::Recommended).is_none());
-        assert!(period_warning(PeriodChoice::Custom(8.0)).is_none());
-        assert!(is_known_virtual_cable("Line 1 (Virtual Audio Cable)"));
-        assert!(is_known_virtual_cable("Hi-Fi Cable Output (VB-Audio Hi-Fi Cable)"));
-        assert!(!is_known_virtual_cable("Microphone (USB)"));
-    }
-
-    #[test]
-    fn readiness_model() {
-        let all_ok = SourceReadiness {
-            capture_present: true,
-            render_present: true,
-            is_default_playback: Some(true),
-            formats_ok: Some(true),
-            notes: vec![],
-        };
-        let rows = readiness_rows(&all_ok, "Line 1 (Virtual Audio Cable)");
-        assert_eq!(rows.len(), 4);
-        assert!(rows.iter().all(|r| r.severity == Severity::Ok));
-        let bad = SourceReadiness {
-            capture_present: false,
-            render_present: true,
-            is_default_playback: Some(false),
-            formats_ok: None,
-            notes: vec![],
-        };
-        let rows = readiness_rows(&bad, "Line 1 (Virtual Audio Cable)");
-        assert_eq!(rows[0].severity, Severity::Fail);
-        assert_eq!(rows[1].severity, Severity::Ok);
-        assert_eq!(rows[2].severity, Severity::Warn);
-        assert!(rows[2].text.contains("Set Line 1 as default playback in Windows Sound settings"));
-        assert_eq!(rows[3].severity, Severity::Unknown);
-        let none = readiness_rows(&SourceReadiness::default(), "Hi-Fi Cable Output");
-        assert_eq!(none[2].severity, Severity::Unknown);
-        assert_eq!(Severity::Fail.mark(), "\u{2716}");
-        assert!(waiting_for_line1_text().contains("keeps retrying"));
-    }
-
-    #[test]
-    fn fallback_and_status_texts() {
-        assert_eq!(fallback_banner_text("Capture fell back to Shared (10 ms): x"), "Capture fell back to Shared (10 ms): x");
-        assert_eq!(fallback_banner_text("repeated blocks"), "Capture fell back to Shared (10 ms): repeated blocks");
+    fn status_texts() {
         assert_eq!(frames_ms_text(288, 48000), "288 frames (6.0 ms)");
         assert_eq!(frames_ms_text(288, 0), "288 frames");
-        assert_eq!(period_status_text(0, 480, 48000), "driver default, granted 480 frames (10.0 ms)");
-        assert_eq!(period_status_text(288, 288, 48000), "requested 288 frames (6.0 ms) = granted 288 frames (6.0 ms)");
-        assert!(period_status_text(240, 288, 48000).contains("granted 288 frames"));
-        let k = KeepAliveStatus {
-            render_name: "Line 1".into(),
-            engine_period_before_ms: Some(10.0),
-            engine_period_after_ms: None,
-        };
-        assert_eq!(keepalive_text(&k), "Line 1: engine period 10.0 \u{2192} ? ms");
-        assert_ne!(capture_segment_label(true), capture_segment_label(false));
     }
 
     #[test]
-    fn learned_margin_per_device() {
+    fn learned_margin_is_for_the_bridge_source() {
         let mut c = Config::default();
-        assert!(learned_margin_text(&c).starts_with("not learned for Hi-Fi Cable Output"));
+        assert!(learned_margin_text(&c).starts_with("not learned for the bridge source"));
         c.set_jitter_margin(3.2);
-        assert_eq!(learned_margin_text(&c), "learned margin 3.2 ms for Hi-Fi Cable Output");
-        c.apply_source_preset(SourcePreset::Vac);
-        assert!(learned_margin_text(&c).contains("not learned for Line 1"));
+        assert_eq!(learned_margin_text(&c), "learned margin 3.2 ms for the bridge source");
+        c.set_jitter_margin(0.0);
+        assert!(learned_margin_text(&c).starts_with("not learned"));
     }
 
     #[test]
@@ -560,8 +269,6 @@ mod tests {
         assert_eq!(render_segment_label(&est), "Render side (estimate, not measured)");
         let t = render_side_text(&est, 0);
         assert!(t.contains("estimate, not measured") && t.contains("router-cli latency") && t.contains("20 ms"), "{t}");
-        let cable = LatencyBreakdown { render_basis: RenderBasis::EstimateCable, render_side_ms: 100.0, ..Default::default() };
-        assert!(render_side_text(&cable, 0).contains("typical on this driver, measure to confirm"));
         let m = RenderSide { ms: 34.0, basis: RenderBasis::Measured { unix_s: 1_791_590_400 }, estimate_ms: 20.0, measured_total_ms: Some(64.5) };
         let b = LatencyBreakdown { render_side_ms: m.ms, render_basis: m.basis, render_estimate_ms: 20.0, measured_total_ms: m.measured_total_ms, total_ms: 63.0, ..Default::default() };
         assert_eq!(render_segment_label(&b), "Render side (measured 2026-10-10)");
@@ -582,7 +289,7 @@ mod tests {
         assert!(rate_hint(48000, 48000).is_none());
         assert!(rate_hint(0, 48000).is_none());
         let h = rate_hint(44100, 48000).unwrap();
-        assert!(h.contains("44100 Hz") && h.contains("48000 Hz") && h.contains("same rate"));
+        assert!(h.contains("44100 Hz") && h.contains("48000 Hz") && h.contains("resampled"));
     }
 
     #[test]

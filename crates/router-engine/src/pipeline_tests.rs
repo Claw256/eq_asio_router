@@ -51,6 +51,17 @@ fn sine_cfg(gain_db: f64) -> Config {
 }
 
 fn rig(cfg: &Config, cable_rate: u32, status: Option<Arc<StatusWriter>>) -> Rig {
+    rig_probe(cfg, cable_rate, status, None)
+}
+
+/// As [`rig`], with a latency probe wired into the source tap (its capture detector scans
+/// every block popped from the source, like the bridge source does in a measurement run).
+fn rig_probe(
+    cfg: &Config,
+    cable_rate: u32,
+    status: Option<Arc<StatusWriter>>,
+    probe: Option<Arc<crate::probe::ProbeShared>>,
+) -> Rig {
     let period = (cable_rate / 100) as usize; // 10 ms packets
     let target = plan_target(2.0, FRAMES as u32, cable_rate, ASIO_RATE, burst_estimate(period as u32, 0, 0));
     let (prod, cons) = ring::channel(plan_capacity(FRAMES as u32, cable_rate, ASIO_RATE, 4096));
@@ -60,7 +71,7 @@ fn rig(cfg: &Config, cable_rate: u32, status: Option<Arc<StatusWriter>>) -> Rig 
     let eq = EqProcessor::new(f64::from(ASIO_RATE), cfg, 2, handoff.clone());
     let matcher = RateMatcher::new(RateMatcherConfig::new(cable_rate, ASIO_RATE, target, ResamplerQuality::Cubic));
     let pipe = Pipeline::new(PipelineInit {
-        consumer: cons,
+        source: crate::pipeline::PipelineSource::Local(cons),
         matcher,
         eq,
         frames: FRAMES,
@@ -73,6 +84,9 @@ fn rig(cfg: &Config, cable_rate: u32, status: Option<Arc<StatusWriter>>) -> Rig 
         quality: ResamplerQuality::Cubic,
         tap_resample: None,
         tap_eq: None,
+        source_probe: probe,
+        source_tap: None,
+        loopback: None,
     });
     let mut bufs = vec![vec![0x5555_5555i32; FRAMES * 2]; 2];
     let ptrs = Arc::new(PtrTable::default());
@@ -92,7 +106,7 @@ impl Rig {
         let pairs = (t_s / 0.020).floor() as u64 + 1;
         while self.pushed < pairs * 2 * self.period as u64 {
             let n = self.period * 2;
-            let click = self.click_at.map(|_| wasapi_capture::click_samples(wasapi_capture::ImpulseShape::default(), self.cable_rate, -40.0));
+            let click = self.click_at.map(|_| router_core::click::click_samples(router_core::click::ImpulseShape::default(), self.cable_rate, -40.0));
             let l: Vec<f32> = (0..n)
                 .map(|i| {
                     let j = self.pushed + i as u64;
@@ -330,6 +344,41 @@ fn loopback_probe_is_inert_until_armed() {
     assert!(shared.loopback.take().is_none());
 }
 
+#[test]
+fn source_tap_feeds_the_capture_detector() {
+    // Stage-1 of `router-cli latency` under the bridge: the quiet click is injected upstream
+    // and must be seen on the source side (every block popped from the source ring) while the
+    // capture detector is armed. No WASAPI anywhere: the tap lives in `Pipeline::render`.
+    let shared = Arc::new(ProbeShared::default());
+    let mut rig = rig_probe(&sine_cfg(0.0), 48000, None, Some(shared.clone()));
+    rig.click_at = Some(30_000);
+    shared.capture.arm(10f32.powf(-50.0 / 20.0));
+    for _ in 0..200 {
+        rig.callback();
+        if shared.capture.is_done() {
+            break;
+        }
+    }
+    assert!(shared.capture.is_done(), "the source tap never saw the click");
+    let det = shared.capture.take().unwrap();
+    assert!(det.block_len > 0 && det.block_len <= 4096, "block_len {}", det.block_len);
+    assert!(det.peak > 0.003 && det.peak < 0.011, "peak {} (-40 dBFS click must pass unattenuated)", det.peak);
+    assert!(det.qpc > 0);
+    // Idle again after take(): further pops do nothing without a new arm.
+    for _ in 0..10 {
+        rig.callback();
+    }
+    assert!(!shared.capture.is_active() && shared.capture.take().is_none());
+    // Never armed: pops must not feed anything.
+    let shared2 = Arc::new(ProbeShared::default());
+    let mut rig2 = rig_probe(&sine_cfg(0.0), 48000, None, Some(shared2.clone()));
+    rig2.click_at = Some(10_000);
+    for _ in 0..40 {
+        rig2.callback();
+    }
+    assert!(!shared2.capture.is_done() && !shared2.capture.is_active());
+}
+
 /// Feeds `x` (stereo-identical) through a [`LoopbackTap`] as Int32 ASIO blocks of `FRAMES`; `per_block(k)` runs
 /// before block `k` is scanned (arming, monitor control).
 fn feed_tap(shared: &Arc<ProbeShared>, x: &[f32], mut per_block: impl FnMut(usize)) {
@@ -422,7 +471,7 @@ fn loopback_high_frequency_click_is_found_through_microphone_noise() {
     let d = shared.loopback.take().unwrap();
     let pos = (d.qpc / 1000) as usize * FRAMES + d.offset as usize;
     // The detector's own delay (filter + RMS window) is removed with the reference bias.
-    let shape = wasapi_capture::ImpulseShape::Burst { freq_hz: 18500.0, dur_ms: 2.0 };
+    let shape = router_core::click::ImpulseShape::Burst { freq_hz: 18500.0, dur_ms: 2.0 };
     let bias = crate::probe::band_onset_bias_frames(shape, 48000, 16000.0, d.threshold, d.peak);
     let first = pos as f64 - bias;
     assert!((first - click_at as f64).abs() <= 3.0, "detected at {pos} (bias {bias}) -> {first}, click at {click_at}");

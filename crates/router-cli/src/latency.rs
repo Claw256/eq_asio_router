@@ -1,9 +1,10 @@
 //! `router-cli latency`: end-to-end click latency of the router.
 //!
-//! A very quiet windowed click is rendered into the cable's playback endpoint (the app -> cable render
-//! side), travels cable -> WASAPI capture -> ring -> resampler -> EQ -> Yamaha ASIO output, and is detected on
-//! the Yamaha's own loopback inputs ("UR22C Streaming L/R"), with QPC timestamps at both ends and at the
-//! router's capture side. See `docs/latency.md` for the definitions.
+//! A very quiet windowed click is rendered into VBMatrix's render endpoint ("VBMatrix In *", the
+//! app -> VBMatrix side), travels VBMatrix -> virtual ASIO driver -> ring A -> resampler -> EQ ->
+//! Yamaha ASIO output, and is detected at two points with QPC timestamps: on the bridge source
+//! side (stage 1, the ring-A source tap of the running engine) and on the Yamaha's own loopback
+//! inputs ("UR22C Streaming L/R", stage 2). See `docs/latency.md` for the definitions.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -17,8 +18,8 @@ use router_engine::probe::{
 };
 use router_engine::{Engine, EngineOptions, EngineState, EngineStatus, LatencyProbe, LoopbackProbe};
 use wasapi_capture::{
-    find_device, is_sink_allowed, pair_render_name, qpc_hz, validate_peak_dbfs, Flow, ImpulseRenderOptions, ImpulseRenderer,
-    ImpulseShape, ImpulseTimes, RenderFill, RenderMode, RenderPrefill, DEFAULT_IMPULSE_DBFS, MAX_IMPULSE_DBFS,
+    find_device, is_sink_allowed, is_vbmatrix_render_name, list_endpoints, qpc_hz, validate_peak_dbfs, Flow, ImpulseRenderOptions,
+    ImpulseRenderer, ImpulseShape, ImpulseTimes, RenderFill, RenderMode, RenderPrefill, DEFAULT_IMPULSE_DBFS, MAX_IMPULSE_DBFS,
 };
 use eq_core::{MeasuredEntry, MeasuredLatency, DEFAULT_RENDER_PROFILE, MIN_CLICKS_TO_SAVE};
 
@@ -29,7 +30,7 @@ const MAX_COUNT: u32 = 10;
 const MAX_WAIT_PER_CLICK: Duration = Duration::from_secs(4);
 /// The router's output must stay below this while measuring (dBFS); above it the run is aborted at once.
 const OUTPUT_ABORT_DBFS: f32 = -40.0;
-/// Before the first click the router output must be quieter than this (the cable must be idle).
+/// Before the first click the router output must be quieter than this (the source must be idle).
 const IDLE_OUTPUT_DBFS: f32 = -70.0;
 /// Length of the quiet baseline that precedes the clicks (thresholds are derived from it).
 const BASELINE_MS: u64 = 1000;
@@ -148,9 +149,11 @@ fn parse_options(args: &[String]) -> Result<Options> {
     })
 }
 
-/// Default sink: the render endpoint paired with the configured capture endpoint.
-pub fn default_sink(capture_device: &str) -> Option<String> {
-    pair_render_name(capture_device)
+/// Default sink: VBMatrix's render endpoint ("VBMatrix In ..."), where applications render since
+/// the bridge cutover — the only place a click enters the router chain. `None` if VBMatrix exposes
+/// no such endpoint (pass `--sink` explicitly).
+pub fn default_sink() -> Option<String> {
+    list_endpoints(Flow::Render).ok()?.into_iter().find(|e| is_vbmatrix_render_name(&e.name)).map(|e| e.name)
 }
 
 /// One finished impulse.
@@ -180,16 +183,16 @@ pub fn run(args: &[String]) -> Result<()> {
         return run_baseline(args, &o, &cfg);
     }
 
-    let sink_name = match (&o.sink, default_sink(&cfg.capture_device)) {
+    let sink_name = match (&o.sink, default_sink()) {
         (Some(s), _) => s.clone(),
         (None, Some(s)) => s,
-        (None, None) => bail!("cannot derive the default sink from capture device \"{}\"; pass --sink", cfg.capture_device),
+        (None, None) => bail!("no VBMatrix render endpoint (\"VBMatrix In ...\") found; pass --sink"),
     };
     // Resolve and vet the sink BEFORE touching the Yamaha.
     let ep = find_device(Flow::Render, &sink_name).map_err(|e| anyhow!("sink \"{sink_name}\": {e}"))?;
     if !is_sink_allowed(&ep.name, &o.allow_sink) {
         bail!(
-            "refusing sink \"{}\": it is not a known virtual cable (a real output could be loud). Use a cable endpoint, or --allow-sink \"{}\" if you really mean it",
+            "refusing sink \"{}\": it is not a known virtual cable or a VBMatrix render endpoint (a real output could be loud). Use \"VBMatrix In ...\", or --allow-sink \"{}\" if you really mean it",
             ep.name,
             ep.name
         );
@@ -202,10 +205,11 @@ pub fn run(args: &[String]) -> Result<()> {
         o.interval_ms,
         ep.name
     );
-    if let Some(expect) = pair_render_name(&cfg.capture_device) {
-        if !ep.name.to_lowercase().contains(&expect.to_lowercase()) && !expect.to_lowercase().contains(&ep.name.to_lowercase()) {
-            println!("note: the sink \"{}\" is not the render side of the capture endpoint \"{}\" (expected \"{expect}\"): the click may never reach the router", ep.name, cfg.capture_device);
-        }
+    if !is_vbmatrix_render_name(&ep.name) {
+        println!(
+            "note: the sink \"{}\" is not a VBMatrix render endpoint (\"VBMatrix In ...\"): the click reaches the router only if VBMatrix routes it there",
+            ep.name
+        );
     }
 
     let engine = start_engine(args, &cfg)?;
@@ -253,10 +257,10 @@ fn start_engine(args: &[String], cfg: &eq_core::Config) -> Result<Engine> {
     Engine::start_with(cfg.clone(), opts).map_err(|e| anyhow!("{e}"))
 }
 
-/// `latency --baseline`: levels at the capture sink and the Yamaha loopback inputs with nothing injected.
+/// `latency --baseline`: levels at the bridge source side and the Yamaha loopback inputs with nothing injected.
 fn run_baseline(args: &[String], o: &Options, cfg: &eq_core::Config) -> Result<()> {
     println!(
-        "latency --baseline: {:.1} s of levels at the capture sink and at the Yamaha loopback inputs; no click is rendered and nothing is played into any endpoint; preamp forced to {FORCED_PREAMP_DB} dB, limiter on",
+        "latency --baseline: {:.1} s of levels at the bridge source side and at the Yamaha loopback inputs; no click is rendered and nothing is played into any endpoint; preamp forced to {FORCED_PREAMP_DB} dB, limiter on",
         o.seconds
     );
     let engine = start_engine(args, cfg)?;
@@ -388,7 +392,7 @@ fn wait_steady(engine: &Engine, idle_msg: &str) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
     let s = engine.status();
-    // The status snapshot is refreshed periodically: printing the header only now shows the real capture device.
+    // The status snapshot is refreshed periodically: printing the header only now shows the live source.
     for l in capture_summary(&s) {
         println!("{l}");
     }
@@ -404,7 +408,7 @@ fn measure_all(engine: &Engine, cfg: &eq_core::Config, o: &Options, sink: &str) 
     let info = wait_for_info(&probe)?;
     print_loopback_info(&info);
 
-    // Render stream (silence until a click is requested). Also keeps the cable's render clock running.
+    // Render stream (silence until a click is requested). Also keeps VBMatrix's render clock running.
     let mut ropts = o.render.clone();
     ropts.endpoint = sink.to_string();
     ropts.allow_endpoint = o.allow_sink.clone();
@@ -436,7 +440,7 @@ fn measure_all(engine: &Engine, cfg: &eq_core::Config, o: &Options, sink: &str) 
         render_profile(&ropts)
     );
 
-    wait_steady(engine, "before any click (something else is playing into the cable)")?;
+    wait_steady(engine, "before any click (something else is playing into VBMatrix)")?;
 
     // Quiet baseline: statistics of both detectors' inputs; the thresholds are derived from them (DC removed).
     let click_db = o.db;
@@ -457,7 +461,7 @@ fn measure_all(engine: &Engine, cfg: &eq_core::Config, o: &Options, sink: &str) 
     let rep_hp = hp.map(|_| probe.monitor_hp());
     print_baseline_short(&rep, rep_hp.as_ref());
     if worst_out > IDLE_OUTPUT_DBFS {
-        bail!("baseline is not quiet at the router output: peak {worst_out:.1} dBFS (limit {IDLE_OUTPUT_DBFS:.0}): another program is playing into the cable; aborting");
+        bail!("baseline is not quiet at the router output: peak {worst_out:.1} dBFS (limit {IDLE_OUTPUT_DBFS:.0}): another program is playing into VBMatrix; aborting");
     }
     let env_gain = hp.map(|fc| band_gain_db(o.shape, info.asio_rate, fc)).unwrap_or(0.0);
     let thr = plan_thresholds_checked(
@@ -479,7 +483,7 @@ fn measure_all(engine: &Engine, cfg: &eq_core::Config, o: &Options, sink: &str) 
         }
     }
     println!(
-        "thresholds: capture {:.1} dBFS (floor {:.1}, click {:.0}); loopback {:.1} dBFS (floor {:.1}, expected click {:.0} dBFS); baseline means (linear) removed: capture {:+.2e}/{:+.2e}, loopback {:+.2e}/{:+.2e}",
+        "thresholds: source {:.1} dBFS (floor {:.1}, click {:.0}); loopback {:.1} dBFS (floor {:.1}, expected click {:.0} dBFS); baseline means (linear) removed: source {:+.2e}/{:+.2e}, loopback {:+.2e}/{:+.2e}",
         thr.cap_db, thr.cap_floor_db, click_db, thr.lb_db, thr.lb_floor_db, thr.lb_expected_db, thr.dc[0], thr.dc[1], thr.dc[2], thr.dc[3]
     );
     let (cap_thr, lb_thr, dc, lb_expected_db) = (thr.cap_db, thr.lb_db, thr.dc, thr.lb_expected_db);
@@ -550,7 +554,7 @@ fn measure_all(engine: &Engine, cfg: &eq_core::Config, o: &Options, sink: &str) 
             None => {
                 failures += 1;
                 println!(
-                    "{:>3}  {:>10}  no click detected within {:.0} s (capture {})",
+                    "{:>3}  {:>10}  no click detected within {:.0} s (stage 1 {})",
                     k + 1,
                     "-",
                     MAX_WAIT_PER_CLICK.as_secs_f64(),
@@ -575,7 +579,7 @@ fn measure_all(engine: &Engine, cfg: &eq_core::Config, o: &Options, sink: &str) 
                 if !plausible(&m) {
                     spurious += 1;
                     println!(
-                        "{:>3}  discarded: stray loopback event, not the click (capture-side detection {}, total {:.1} ms, loopback peak {:.0} dBFS)",
+                        "{:>3}  discarded: stray loopback event, not the click (stage-1 detection {}, total {:.1} ms, loopback peak {:.0} dBFS)",
                         k + 1,
                         if m.stage1_ms.is_some() { "present" } else { "missing" },
                         m.total_ms,
@@ -668,7 +672,7 @@ fn fmt_db(x: f64) -> String {
 
 /// One line per channel (printed before the clicks).
 fn print_baseline_short(rep: &[ChannelReport; 4], hp: Option<&[ChannelReport; 2]>) {
-    let names = ["capture L", "capture R", "loopback L", "loopback R"];
+    let names = ["source L", "source R", "loopback L", "loopback R"];
     for (n, c) in names.iter().zip(rep) {
         println!(
             "baseline {n:<10} peak {} rms {} dc {} deviation {} (p99 {}) dBFS ({}, {} blocks)",
@@ -690,7 +694,7 @@ fn print_baseline_short(rep: &[ChannelReport; 4], hp: Option<&[ChannelReport; 2]
 
 /// Full per-channel table of `--baseline`.
 fn print_baseline_full(rep: &[ChannelReport; 4]) {
-    let names = ["capture sink L", "capture sink R", "loopback in L", "loopback in R"];
+    let names = ["source L", "source R", "loopback in L", "loopback in R"];
     for (k, (n, c)) in names.iter().zip(rep).enumerate() {
         println!("{n}: {} blocks, {} samples", c.blocks, c.samples);
         println!(
@@ -750,7 +754,7 @@ fn baseline_all(engine: &Engine, o: &Options) -> Result<Outcome> {
     }
     let info = wait_for_info(&probe)?;
     print_loopback_info(&info);
-    wait_steady(engine, "while measuring the baseline (something is playing into the cable)")?;
+    wait_steady(engine, "while measuring the baseline (something is playing into VBMatrix)")?;
     let hp_fc = match o.hp_hz {
         Some(Some(f)) => f,
         _ => BASELINE_HP_HZ,
@@ -793,7 +797,7 @@ fn baseline_all(engine: &Engine, o: &Options) -> Result<Outcome> {
             c.character.describe()
         );
     }
-    for (name, x) in [("capture L", &raw[0]), ("loopback L", &raw[2])] {
+    for (name, x) in [("source L", &raw[0]), ("loopback L", &raw[2])] {
         let pk = spectrum_peaks(x, info.asio_rate.max(1), 6);
         if !pk.is_empty() {
             let t: Vec<String> = pk.iter().map(|(f, d)| format!("{f:.0} Hz {d:.1} dBFS")).collect();
@@ -816,7 +820,7 @@ fn baseline_all(engine: &Engine, o: &Options) -> Result<Outcome> {
         for (label, h) in [("full-band 1.5 kHz click", None), ("high-frequency click (--shape burst:18500:2)", Some(&rep_hp))] {
             match plan_thresholds_checked(&rep, h, g, click, FORCED_PREAMP_DB, o.cap_threshold_db, o.lb_threshold_db, h.is_some()) {
                 Ok(t) => println!(
-                    "click {click:.0} dBFS, {label}: detectable; thresholds capture {:.1} dBFS, loopback {:.1} dBFS (floor {:.1}, expected click at the loopback {:.0} dBFS, margin {:.1} dB)",
+                    "click {click:.0} dBFS, {label}: detectable; thresholds source {:.1} dBFS, loopback {:.1} dBFS (floor {:.1}, expected click at the loopback {:.0} dBFS, margin {:.1} dB)",
                     t.cap_db,
                     t.lb_db,
                     t.lb_floor_db,
@@ -833,8 +837,8 @@ fn baseline_all(engine: &Engine, o: &Options) -> Result<Outcome> {
 /// Capture -> loopback tap beyond this is not a router path (measured 21 to 30 ms on VAC, about 45 ms on the Hi-Fi Cable).
 const MAX_PLAUSIBLE_CAP_TO_TAP_MS: f64 = 300.0;
 
-/// A genuine click is seen by the capture side first and reaches the loopback tap later (injection -> capture within
-/// a second, capture -> tap within [`MAX_PLAUSIBLE_CAP_TO_TAP_MS`]). A loopback crossing without a capture-side detection, or before it, or seconds late is a stray
+/// A genuine click is seen by the source side first (stage 1, the ring-A tap) and reaches the loopback tap later (injection -> source within
+/// a second, source -> tap within [`MAX_PLAUSIBLE_CAP_TO_TAP_MS`]). A loopback crossing without a stage-1 detection, or before it, or seconds late is a stray
 /// event (microphone noise at about the expected level) and is not a measurement.
 fn plausible(m: &Measurement) -> bool {
     match (m.stage1_ms, m.stage2_ms) {
@@ -846,7 +850,7 @@ fn plausible(m: &Measurement) -> bool {
 fn note_for(row: &Row, t: &ImpulseTimes, lb_peak: f32) -> String {
     let mut n = Vec::new();
     if !row.capture_seen {
-        n.push("no capture-side detection".to_string());
+        n.push("no stage-1 detection (bridge tap)".to_string());
     }
     n.push(format!("lb peak {:.0} dBFS", 20.0 * lb_peak.max(1e-9).log10()));
     n.push(format!("pad {} fr ({:.1} ms)", t.padding_frames, f64::from(t.padding_frames) * 1000.0 / row.rate_hz.max(1.0)));
@@ -868,11 +872,10 @@ fn wait_for_info(p: &LatencyProbe) -> Result<router_engine::ProbeInfo> {
 
 fn capture_summary(s: &EngineStatus) -> Vec<String> {
     vec![format!(
-        "router: capture \"{}\" {} Hz mode {} period {} fr ({:.1} ms) -> asio {} Hz buffer {} fr",
-        s.capture_device,
+        "router: source \"{}\" {} Hz period {} fr ({:.1} ms) -> asio {} Hz buffer {} fr (stage 1 = bridge source tap)",
+        s.source_name,
         s.cable_rate,
-        s.capture_mode_in_use.map(|m| m.name()).unwrap_or("-"),
-        s.capture_period_frames_granted,
+        s.capture_period_frames,
         f64::from(s.capture_period_us) / 1000.0,
         s.asio_rate,
         s.buffer_size
@@ -920,8 +923,8 @@ fn print_summary(rows: &[Row], end: &EngineStatus, probe: &LatencyProbe, o: &Opt
     for (label, v) in [
         ("(a) total inj->loopback", &sm.total),
         ("(b) corrected (device in)", &sm.corrected),
-        ("inj->capture delivery", &sm.stage1),
-        ("capture->loopback tap", &sm.stage2),
+        ("inj->bridge src (stage 1)", &sm.stage1),
+        ("bridge src->loopback tap", &sm.stage2),
         ("render queue (WASAPI)", &sm.render_q),
         ("to-DAC estimate (mid)", &sm.dac_mid),
     ] {
@@ -955,7 +958,7 @@ fn print_summary(rows: &[Row], end: &EngineStatus, probe: &LatencyProbe, o: &Opt
     let (lo, hi, mid) = (med(&sm.dac_lo), med(&sm.dac_hi), med(&sm.dac_mid));
     println!();
     println!(
-        "model (latency panel): Yamaha out {:.1} + ring {:.1} + capture staleness {:.1} + render side {:.0} ({}) = {:.1} ms",
+        "model (latency panel): Yamaha out {:.1} + ring {:.1} + source staleness {:.1} + render side {:.0} ({}) = {:.1} ms",
         lat.master_out_ms,
         lat.ring_ms,
         lat.capture_ms,
@@ -976,7 +979,7 @@ fn print_summary(rows: &[Row], end: &EngineStatus, probe: &LatencyProbe, o: &Opt
             info.output_latency
         );
         println!(
-            "=> implied render side = measured - (Yamaha out + ring + capture) = {:.1} ms (range {:.1}..{:.1}) versus the default estimate of {:.0} ms (measured total {:.1} ms vs model total {:.1} ms with that estimate)",
+            "=> implied render side = measured - (Yamaha out + ring + source staleness) = {:.1} ms (range {:.1}..{:.1}) versus the default estimate of {:.0} ms (measured total {:.1} ms vs model total {:.1} ms with that estimate)",
             mid - known,
             lo - known,
             hi - known,
@@ -987,7 +990,7 @@ fn print_summary(rows: &[Row], end: &EngineStatus, probe: &LatencyProbe, o: &Opt
     }
     if let (Some(s1), Some(s2)) = (s1, s2) {
         println!(
-            "stages: injection -> capture delivery {:.1} ms (model render {:.0} + capture staleness {:.1} = {:.1}); capture -> loopback tap {:.1} ms (model ring {:.1} + ASIO block {:.1} + part of out)",
+            "stages: injection -> bridge source arrival {:.1} ms (stage 1 via the ring-A source tap; model render {:.0} + source staleness {:.1} = {:.1}); bridge src -> loopback tap {:.1} ms (model ring {:.1} + ASIO block {:.1} + part of out)",
             s1,
             lat.render_side_ms,
             lat.capture_ms,
@@ -997,7 +1000,7 @@ fn print_summary(rows: &[Row], end: &EngineStatus, probe: &LatencyProbe, o: &Opt
             n_samples * 1000.0 / rate
         );
         println!(
-            "   direct render side = injection->capture {:.1} - measured capture staleness {:.1} = {:.1} ms; render queue in the WASAPI stream (clock estimate) {} ms",
+            "   direct render side = injection->source {:.1} - measured source staleness {:.1} = {:.1} ms; render queue in the WASAPI stream (clock estimate) {} ms",
             s1,
             lat.capture_ms,
             s1 - lat.capture_ms,
@@ -1005,7 +1008,7 @@ fn print_summary(rows: &[Row], end: &EngineStatus, probe: &LatencyProbe, o: &Opt
         );
     }
     println!(
-        "router state during the run: ring mean {} fr (target {}), underruns {}, xruns {}, fault {:?}, capture period {} fr",
+        "router state during the run: ring mean {} fr (target {}), underruns {}, xruns {}, fault {:?}, source period {} fr",
         end.ring_mean_fill_frames, end.ring_target_frames, end.underruns, end.xruns, end.fault, end.capture_period_frames
     );
     println!("(a) = injection -> click at the Yamaha loopback input stream (block-end anchored); (b) = (a) minus the driver's input latency beyond the block; to-DAC = (b) + 0..(out latency - block). All driver-latency terms are estimates.");
@@ -1027,11 +1030,11 @@ fn build_entry(rows: &[Row], end: &EngineStatus, o: &Options, now_unix_s: u64) -
     let to_dac = med(&sm.dac_mid)?;
     let known = lat.master_out_ms + lat.ring_ms + lat.capture_ms;
     let render_side = (to_dac - known).max(0.0);
-    if !render_side.is_finite() || end.capture_device.is_empty() {
+    if !render_side.is_finite() || !end.bridge_attached {
         return None;
     }
     Some(MeasuredEntry {
-        capture_device: end.capture_device.clone(),
+        source: eq_core::BRIDGE_SOURCE_KEY.to_string(),
         render_side_ms: render_side,
         render_queue_ms: med(&sm.render_q).unwrap_or(0.0),
         inj_to_capture_ms: med(&sm.stage1).unwrap_or(0.0),
@@ -1043,7 +1046,6 @@ fn build_entry(rows: &[Row], end: &EngineStatus, o: &Options, now_unix_s: u64) -
         measured_unix_s: now_unix_s,
         asio_buffer: end.buffer_size,
         capture_period_frames: end.capture_period_frames,
-        keepalive: end.keepalive.is_some(),
         safety_ms: end.safety_buffer_ms,
         target_frames: end.ring_target_frames,
         render_profile: render_profile(&o.render),
@@ -1061,15 +1063,14 @@ fn save_measurement(rows: &[Row], end: &EngineStatus, o: &Options) {
         println!("not saved: {} clicks, at least {MIN_CLICKS_TO_SAVE} are needed", rows.len());
     } else {
         match build_entry(rows, end, o, eq_core::now_unix_s()) {
-            None => println!("not saved: the result is incomplete (no to-DAC estimate or capture device)"),
+            None => println!("not saved: the result is incomplete (no to-DAC estimate or no bridge session)"),
             Some(e) => match MeasuredLatency::record_default(e.clone()) {
                 Ok(path) => println!(
-                    "saved to {} ({}, render side {:.1} ms, total {:.1} ms, keep-alive {}, capture period {} fr, ASIO buffer {} fr)",
+                    "saved to {} (source {}, render side {:.1} ms, total {:.1} ms, source period {} fr, ASIO buffer {} fr)",
                     path.display(),
-                    e.capture_device,
+                    e.source,
                     e.render_side_ms,
                     e.to_dac_ms,
-                    if e.keepalive { "on" } else { "off" },
                     e.capture_period_frames,
                     e.asio_buffer
                 ),
@@ -1176,7 +1177,12 @@ fn selftest() -> Result<()> {
             failures += 1;
         }
     }
-    for (name, ok) in [("Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)", true), ("Line 1 (Virtual Audio Cable)", true), ("Headphones (Yamaha UR22C)", false)] {
+    for (name, ok) in [
+        ("Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)", true),
+        ("Line 1 (Virtual Audio Cable)", true),
+        ("VBMatrix In 3 (VB-Audio Matrix VAIO)", true),
+        ("Headphones (Yamaha UR22C)", false),
+    ] {
         let accepted = is_sink_allowed(name, &[]);
         println!("  guard: sink \"{name}\" -> {}", if accepted { "allowed" } else { "refused" });
         if accepted != ok {
@@ -1270,10 +1276,14 @@ mod tests {
     }
 
     #[test]
-    fn default_sink_pairs_with_the_capture_endpoint() {
-        assert_eq!(default_sink("Hi-Fi Cable Output").as_deref(), Some("Hi-Fi Cable Input"));
-        assert_eq!(default_sink("Line 1 (Virtual Audio Cable)").as_deref(), Some("Line 1 (Virtual Audio Cable)"));
-        assert_eq!(default_sink(""), None);
+    fn vbmatrix_render_endpoints_are_allowed_sinks() {
+        // The default sink is "VBMatrix In ..." (found by enumeration at runtime); the pure
+        // allowlist rules are what matter here (no hardware).
+        assert!(is_vbmatrix_render_name("VBMatrix In 3 (VB-Audio Matrix VAIO)"));
+        assert!(is_vbmatrix_render_name("vbmatrix in 1"));
+        assert!(!is_vbmatrix_render_name("VBMatrix Out 1"));
+        assert!(is_sink_allowed("VBMatrix In 3 (VB-Audio Matrix VAIO)", &[]));
+        assert!(!is_sink_allowed("Headphones (Yamaha UR22C)", &[]));
     }
 
     #[test]
@@ -1314,7 +1324,7 @@ mod tests {
     fn stray_loopback_events_are_not_measurements() {
         let ok = Measurement { stage1_ms: Some(22.0), stage2_ms: Some(30.0), corrected_ms: 51.0, ..Measurement::default() };
         assert!(plausible(&ok));
-        assert!(!plausible(&Measurement { stage1_ms: None, ..ok }), "no capture-side detection");
+        assert!(!plausible(&Measurement { stage1_ms: None, ..ok }), "no stage-1 detection");
         assert!(!plausible(&Measurement { stage2_ms: Some(-3.0), ..ok }), "loopback before the capture packet");
         assert!(!plausible(&Measurement { stage2_ms: Some(3523.0), ..ok }), "seconds late");
         assert!(!plausible(&Measurement { stage2_ms: Some(507.0), ..ok }), "half a second is no router path");
@@ -1323,22 +1333,22 @@ mod tests {
 
     #[test]
     fn entry_needs_three_clicks_and_uses_medians() {
-        let mut end = EngineStatus { capture_device: "Line 1 (Virtual Audio Cable)".into(), buffer_size: 256, capture_period_frames: 288, ..EngineStatus::default() };
+        let mut end = EngineStatus { bridge_attached: true, buffer_size: 256, capture_period_frames: 288, ..EngineStatus::default() };
         end.latency = eq_core::LatencyBreakdown { master_out_ms: 7.8, ring_ms: 12.0, capture_ms: 3.0, render_side_ms: 20.0, ..Default::default() };
-        end.keepalive = Some(router_engine::KeepAliveStatus::default());
         let o = parse_options(&a(&[])).unwrap();
         let rows: Vec<Row> = [62.0, 63.0, 64.0].iter().map(|&c| row(c + 1.5, c, 40.0, 23.0, 34.0, c + 1.5)).collect();
         assert!(build_entry(&rows[..2], &end, &o, 1_791_590_400).is_none());
         let e = build_entry(&rows, &end, &o, 1_791_590_400).unwrap();
-        assert_eq!((e.clicks, e.capture_period_frames, e.asio_buffer, e.keepalive), (3, 288, 256, true));
+        assert_eq!((e.clicks, e.capture_period_frames, e.asio_buffer), (3, 288, 256));
+        assert_eq!(e.source, eq_core::BRIDGE_SOURCE_KEY, "keyed on the fixed bridge source");
         assert_eq!(e.date, "2026-10-10");
         assert!((e.total_ms - 63.0).abs() < 1e-9 && (e.to_dac_ms - 64.5).abs() < 1e-9);
         // implied render side = to-DAC median - (out + ring + capture) = 64.5 - 22.8
         assert!((e.render_side_ms - (64.5 - 22.8)).abs() < 1e-9, "{}", e.render_side_ms);
         assert_eq!((e.render_queue_ms, e.inj_to_capture_ms, e.capture_to_tap_ms), (34.0, 40.0, 23.0));
         assert_eq!(e.render_profile, DEFAULT_RENDER_PROFILE);
-        // no capture device name: nothing to key the record on
-        end.capture_device.clear();
+        // no bridge session: nothing to key the record on
+        end.bridge_attached = false;
         assert!(build_entry(&rows, &end, &o, 1).is_none());
     }
 

@@ -17,13 +17,13 @@ use router_core::arrival::{ArrivalStats, ArrivalTracker};
 use router_core::asio_convert::{write_f32_to_asio, write_silence};
 use router_core::logger::Level;
 use router_core::processor::{peak, BlockStats, EqProcessor};
-use router_core::resample::{RateMatcher, RenderStats};
+use router_core::resample::{FrameSource, RateMatcher, RenderStats};
 use router_core::ring::{Consumer, Producer};
 use router_core::rlog;
 use router_core::status_writer::{BlockReport, StatusWriter};
 use router_core::watchdog::Heartbeat;
-use wasapi_capture::FrameSink;
 
+use crate::bridge::BridgeSource;
 use crate::logic::{gap_ratio, underrun_ratio};
 use crate::priority::CallbackMmcss;
 use crate::probe::{LoopbackTap, ProbeShared};
@@ -32,7 +32,7 @@ use crate::tap::TapPoint;
 /// Callbacks ignored for the gap measurement and the worst-case figure (start-up priming).
 pub const WARMUP_CALLBACKS: u64 = 8;
 
-/// ASIO callbacks that must have run before the capture sink starts feeding the ring
+/// ASIO callbacks that must have run before the synthetic feeder starts feeding the ring
 /// (two priming callbacks plus two paced ones).
 pub const SINK_ARM_AFTER_CALLBACKS: u64 = 4;
 
@@ -76,6 +76,10 @@ pub struct Live {
     pub open_bias: AtomicU32,
     /// Mean ring fill (cable frames, f32 bits), exponential average over ~2 s.
     pub fill_mean: AtomicU32,
+    /// Smallest ungated ring fill since the control tick last swapped it out
+    /// (`u32::MAX` = no sample yet). The bridge fill statistics read and reset it
+    /// once per 100 ms tick.
+    pub fill_min_tick: AtomicU32,
     /// Result of the MMCSS registration of the ASIO callback thread (0 not yet, 1 ok, 2 failed).
     pub mmcss_asio: AtomicU8,
     /// ASIO rate, shared with the config watcher.
@@ -106,6 +110,7 @@ impl Live {
             a.store(0, Relaxed);
         }
         self.mmcss_asio.store(0, Relaxed);
+        self.fill_min_tick.store(u32::MAX, Relaxed);
         self.reset_requested.store(false, Relaxed);
         self.reset_reason.store(RESET_NONE, Relaxed);
         self.panicked.store(false, Relaxed);
@@ -229,9 +234,86 @@ impl OutputSet {
 // Pipeline
 // ------------------------------------------------------------------------------------
 
+/// Where the pipeline reads its source frames from.
+///
+/// `Local` is the in-process SPSC ring (synthetic capture / measurements); `Bridge`
+/// is the shm ring A consumed directly inside the Yamaha callback (the default).
+pub enum PipelineSource {
+    Local(Consumer),
+    Bridge(BridgeSource),
+}
+
+impl FrameSource for PipelineSource {
+    fn fill(&self) -> usize {
+        match self {
+            PipelineSource::Local(c) => c.fill(),
+            PipelineSource::Bridge(b) => b.fill(),
+        }
+    }
+    fn pop(&mut self, l: &mut [f32], r: &mut [f32]) -> usize {
+        match self {
+            PipelineSource::Local(c) => c.pop(l, r),
+            PipelineSource::Bridge(b) => b.pop(l, r),
+        }
+    }
+    fn discard(&mut self, n: usize) -> usize {
+        match self {
+            PipelineSource::Local(c) => c.discard(n),
+            PipelineSource::Bridge(b) => b.discard(n),
+        }
+    }
+}
+
+impl PipelineSource {
+    /// Producer-side frames dropped (in-process ring: our own; bridge: the driver's
+    /// `a_overruns` counter, single writer in the other process).
+    pub fn overruns(&self) -> u64 {
+        match self {
+            PipelineSource::Local(c) => c.overruns(),
+            PipelineSource::Bridge(b) => b.a_overruns(),
+        }
+    }
+}
+
+/// Wraps the pipeline's source and mirrors every popped block into the measurement side:
+/// the latency probe's capture detector (armed only), the baseline monitor and the
+/// `capture_in` dump tap. Allocation-free and lock-free (RT rules); with no probe and no
+/// tap configured it only forwards (one `Option` check per pop).
+struct TappedSource<'a> {
+    inner: &'a mut PipelineSource,
+    probe: Option<&'a Arc<ProbeShared>>,
+    tap: Option<&'a mut TapPoint>,
+}
+
+impl FrameSource for TappedSource<'_> {
+    fn fill(&self) -> usize {
+        self.inner.fill()
+    }
+    fn pop(&mut self, l: &mut [f32], r: &mut [f32]) -> usize {
+        let n = self.inner.pop(l, r);
+        if n > 0 {
+            if let Some(pr) = self.probe {
+                if pr.capture.is_active() {
+                    pr.capture.on_block(&l[..n], &r[..n], qpc());
+                }
+                if pr.monitor.is_active() {
+                    pr.monitor.feed(0, &l[..n], &r[..n]);
+                }
+            }
+            if let Some(t) = self.tap.as_mut() {
+                t.push(&l[..n], &r[..n]);
+            }
+        }
+        n
+    }
+    fn discard(&mut self, n: usize) -> usize {
+        self.inner.discard(n)
+    }
+}
+
 /// Everything the pipeline needs, built on the control thread.
 pub struct PipelineInit {
-    pub consumer: Consumer,
+    pub source: PipelineSource,
     pub matcher: RateMatcher,
     pub eq: EqProcessor,
     pub frames: usize,
@@ -245,11 +327,20 @@ pub struct PipelineInit {
     /// Measurement taps (None = off, zero cost).
     pub tap_resample: Option<TapPoint>,
     pub tap_eq: Option<TapPoint>,
+    /// Source-side measurement tap: `capture_in` dump point, fed with every block popped from
+    /// the source (None = off).
+    pub source_tap: Option<TapPoint>,
+    /// Latency probe of a measurement run: its capture detector and baseline monitor are fed
+    /// from the source pops while armed / monitoring (None = no extra work in the callback).
+    pub source_probe: Option<Arc<ProbeShared>>,
+    /// Post-EQ loopback tap into ring B (None = loopback off). Pushed right after
+    /// `EqProcessor`, before conversion: allocation-free, lock-free (RT rules).
+    pub loopback: Option<Producer>,
 }
 
-/// ring -> [`RateMatcher`] -> [`EqProcessor`] with timing and status bookkeeping.
+/// [`PipelineSource`] -> [`RateMatcher`] -> [`EqProcessor`] with timing and status bookkeeping.
 pub struct Pipeline {
-    consumer: Consumer,
+    source: PipelineSource,
     matcher: RateMatcher,
     eq: EqProcessor,
     l: Vec<f32>,
@@ -276,13 +367,16 @@ pub struct Pipeline {
     fault: u32,
     tap_resample: Option<TapPoint>,
     tap_eq: Option<TapPoint>,
+    source_probe: Option<Arc<ProbeShared>>,
+    source_tap: Option<TapPoint>,
+    loopback: Option<Producer>,
 }
 
 impl Pipeline {
     pub fn new(init: PipelineInit) -> Self {
         let period_s = init.frames as f64 / f64::from(init.asio_rate.max(1));
         Pipeline {
-            consumer: init.consumer,
+            source: init.source,
             matcher: init.matcher,
             eq: init.eq,
             l: vec![0.0; init.frames],
@@ -309,6 +403,9 @@ impl Pipeline {
             fault: 0,
             tap_resample: init.tap_resample,
             tap_eq: init.tap_eq,
+            source_probe: init.source_probe,
+            source_tap: init.source_tap,
+            loopback: init.loopback,
         }
     }
 
@@ -368,7 +465,16 @@ impl Pipeline {
             self.cur_quality = q;
         }
         let (l, r) = (&mut self.l[..n], &mut self.r[..n]);
-        let st = self.matcher.render(&mut self.consumer, l, r);
+        // Source-side tap (latency probe detector / baseline monitor / capture_in dump):
+        // mirrors the frames popped from the ring while a measurement is armed.
+        let st = {
+            let mut tapped = TappedSource {
+                inner: &mut self.source,
+                probe: self.source_probe.as_ref(),
+                tap: self.source_tap.as_mut(),
+            };
+            self.matcher.render(&mut tapped, l, r)
+        };
         if let Some(t) = self.tap_resample.as_mut() {
             t.push(l, r);
         }
@@ -379,6 +485,10 @@ impl Pipeline {
         self.peaks_out = [peak(l), peak(r)];
         if let Some(t) = self.tap_eq.as_mut() {
             t.push(l, r);
+        }
+        // Post-EQ loopback tap into ring B (drained by the non-RT feeder thread).
+        if let Some(p) = self.loopback.as_mut() {
+            p.push_frames(l, r);
         }
         self.last = st;
         if st.discarded > 0 {
@@ -422,7 +532,7 @@ impl Pipeline {
         }
         let live = &*self.live;
         let underruns = self.matcher.underruns();
-        let overruns = self.consumer.overruns();
+        let overruns = self.source.overruns();
         live.callbacks.store(self.n_cb, Relaxed);
         live.underruns.store(underruns, Relaxed);
         live.overruns.store(overruns, Relaxed);
@@ -436,6 +546,8 @@ impl Pipeline {
             let f = self.last.fill as f32;
             self.fill_mean = if self.fill_mean == 0.0 { f } else { self.fill_mean + (f - self.fill_mean) * (1.0 / 188.0) };
             live.fill_mean.store(self.fill_mean.to_bits(), Relaxed);
+            // Smallest fill of this control-tick window (bridge fill statistics).
+            live.fill_min_tick.fetch_min(self.last.fill as u32, Relaxed);
         }
         live.cb_avg_us.store(self.cb_avg.to_bits(), Relaxed);
         live.cb_max_us.store(self.cb_max.to_bits(), Relaxed);
@@ -552,15 +664,16 @@ impl Handler for AudioCallback {
 }
 
 // ------------------------------------------------------------------------------------
-// Capture side
+// Synthetic source feeder
 // ------------------------------------------------------------------------------------
 
-/// `FrameSink` that feeds the SPSC ring. WASAPI delivers in bursts (typically two
-/// 10 ms packets back to back every ~20 ms); the ring's target fill includes the measured
-/// arrival headroom (`router_core::arrival`, fed from here) and the drift controller low-pass
-/// filters the resulting fill sawtooth, so the sink simply pushes. Until `armed` it discards (the ASIO side is
-/// not streaming yet and a stale ring would only add latency).
-pub struct CaptureSink {
+/// Feeds the in-process SPSC ring from the synthetic source thread (measurements): the
+/// generated packets arrive like WASAPI bursts (typically two 10 ms packets back to back
+/// every ~20 ms); the ring's target fill includes the measured arrival headroom
+/// (`router_core::arrival`, fed from here) and the drift controller low-pass filters the
+/// resulting fill sawtooth, so the feeder simply pushes. Until `armed` it discards (the ASIO
+/// side is not streaming yet and a stale ring would only add latency).
+pub struct SynthFeeder {
     producer: Producer,
     heartbeat: Arc<Heartbeat>,
     armed: Arc<AtomicBool>,
@@ -569,16 +682,13 @@ pub struct CaptureSink {
     window_ticks: i64,
     last_ticks: i64,
     burst_acc: u32,
-    tap: Option<TapPoint>,
     arrival: Option<ArrivalTracker>,
     tick_hz: f64,
-    /// Latency probe (capture-side click detector); None = off.
-    probe: Option<Arc<ProbeShared>>,
 }
 
-impl CaptureSink {
+impl SynthFeeder {
     pub fn new(producer: Producer, heartbeat: Arc<Heartbeat>, armed: Arc<AtomicBool>, live: Arc<Live>) -> Self {
-        CaptureSink {
+        SynthFeeder {
             producer,
             heartbeat,
             armed,
@@ -586,34 +696,19 @@ impl CaptureSink {
             window_ticks: qpc_freq() / 2000, // 0.5 ms
             last_ticks: i64::MIN / 2,
             burst_acc: 0,
-            tap: None,
             arrival: None,
             tick_hz: qpc_freq() as f64,
-            probe: None,
         }
     }
 
-    /// Attaches the capture-side detector of the latency probe.
-    pub fn with_probe(mut self, probe: Option<Arc<ProbeShared>>) -> Self {
-        self.probe = probe;
-        self
-    }
-
-    /// Feeds the arrival-jitter statistics (atomics only, no allocation in `on_frames`).
+    /// Feeds the arrival-jitter statistics (atomics only, no allocation here).
     pub fn with_arrival(mut self, stats: Option<Arc<ArrivalStats>>) -> Self {
         self.arrival = stats.map(ArrivalTracker::new);
         self
     }
 
-    /// Attaches the `capture_in` measurement tap.
-    pub fn with_tap(mut self, tap: Option<TapPoint>) -> Self {
-        self.tap = tap;
-        self
-    }
-}
-
-impl FrameSink for CaptureSink {
-    fn on_frames(&mut self, left: &[f32], right: &[f32]) {
+    /// Delivers one generated packet (synthetic source thread; not on any audio callback).
+    pub fn on_frames(&mut self, left: &[f32], right: &[f32]) {
         self.heartbeat.beat_capture();
         // The Yamaha runs its two priming callbacks immediately and then needs ~200 ms
         // before it really streams; data accepted in between is stale and would only be
@@ -621,26 +716,15 @@ impl FrameSink for CaptureSink {
         if !self.armed.load(Relaxed) || self.live.callbacks.load(Relaxed) < SINK_ARM_AFTER_CALLBACKS {
             return;
         }
-        // Burst size: frames delivered by calls less than 0.5 ms apart (WASAPI shared
-        // mode hands over two 10 ms packets back to back every ~20 ms).
+        // Burst size: frames delivered by calls less than 0.5 ms apart (the WASAPI shared
+        // pattern the jitter model imitates: two 10 ms packets back to back every ~20 ms).
         let now = qpc();
-        if let Some(pr) = &self.probe {
-            if pr.capture.is_active() {
-                pr.capture.on_block(left, right, now);
-            }
-            if pr.monitor.is_active() {
-                pr.monitor.feed(0, left, right);
-            }
-        }
         let n = left.len() as u32;
         self.burst_acc = if now - self.last_ticks <= self.window_ticks { self.burst_acc.saturating_add(n) } else { n };
         self.last_ticks = now;
         self.live.burst_max.fetch_max(self.burst_acc, Relaxed);
         if let Some(a) = self.arrival.as_mut() {
             a.on_frames(now as f64 / self.tick_hz, n);
-        }
-        if let Some(t) = self.tap.as_mut() {
-            t.push(left, right);
         }
         self.producer.push_frames(left, right);
     }

@@ -31,7 +31,7 @@ pub fn ui(ui: &mut egui::Ui, app: &mut App) {
     let cable = st.map_or(0, |s| s.cable_rate);
     let yamaha = st.map(|s| s.asio_rate).filter(|r| *r > 0).or(app.snap.caps.as_ref().map(|c| c.sample_rate)).unwrap_or(0);
     egui::Grid::new("rates").num_columns(2).show(ui, |ui| {
-        ui.label("Cable rate");
+        ui.label("Source (bridge)");
         ui.label(if cable > 0 { format!("{cable} Hz") } else { "-".into() });
         ui.end_row();
         ui.label("Yamaha rate");
@@ -54,7 +54,6 @@ pub fn ui(ui: &mut egui::Ui, app: &mut App) {
     if let Some(h) = rate_hint(cable, yamaha) {
         ui.colored_label(crate::app::AMBER, h);
     }
-    crate::panels::cable::ui(ui, app, yamaha);
 
     ui.add_space(4.0);
     let enabled = app.panel_path.is_some();

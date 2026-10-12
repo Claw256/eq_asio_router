@@ -1,0 +1,15 @@
+[package]
+name = "bridge-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Pure rlib: #[repr(C)] POD layout + cross-process SPSC rings + named mapping
+# helpers. No cdylib, no locks, no OS calls inside push/pop.
+[dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+] }

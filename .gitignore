@@ -25,3 +25,6 @@ desktop.ini
 
 # Claude Code local state
 .claude/settings.local.json
+
+# Pi session/agent local state (skills/workflows, if ever added, get re-included)
+/.pi/

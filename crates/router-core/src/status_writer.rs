@@ -55,6 +55,27 @@ pub struct BlockReport {
     pub avg_callback_us: u32,
 }
 
+/// Bridge fields of the block (v3), published from the engine's 100 ms control tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BridgeReport {
+    /// Engine attached to the bridge mapping (1/0).
+    pub attached: u32,
+    /// Driver slot running with a fresh heartbeat (1/0).
+    pub vbmatrix_running: u32,
+    /// Negotiated sample rate (Hz).
+    pub sample_rate: u32,
+    /// Negotiated buffer size (frames).
+    pub buffer_frames: u32,
+    /// Frames in ring A / ring B.
+    pub fill_a: u32,
+    pub fill_b: u32,
+    /// Ring counters (frames), saturated to u32.
+    pub a_overruns: u32,
+    pub a_discarded: u32,
+    pub b_underruns: u32,
+    pub b_dropped: u32,
+}
+
 /// Writer side.
 pub struct StatusWriter {
     base: *mut StatusBlock,
@@ -132,6 +153,16 @@ impl StatusWriter {
             offset_of!(StatusBlock, max_callback_us),
             offset_of!(StatusBlock, avg_callback_us),
             offset_of!(StatusBlock, dropped_logs),
+            offset_of!(StatusBlock, bridge_attached),
+            offset_of!(StatusBlock, vbmatrix_running),
+            offset_of!(StatusBlock, bridge_sample_rate),
+            offset_of!(StatusBlock, bridge_buffer_frames),
+            offset_of!(StatusBlock, fill_a),
+            offset_of!(StatusBlock, fill_b),
+            offset_of!(StatusBlock, a_overruns),
+            offset_of!(StatusBlock, a_discarded),
+            offset_of!(StatusBlock, b_underruns),
+            offset_of!(StatusBlock, b_dropped),
         ] {
             self.a32(off).store(0, Relaxed);
         }
@@ -160,6 +191,20 @@ impl StatusWriter {
     /// Mirror of `Logger::dropped()` (saturating to u32).
     pub fn set_dropped_logs(&self, n: u64) {
         self.a32(offset_of!(StatusBlock, dropped_logs)).store(n.min(u64::from(u32::MAX)) as u32, Relaxed);
+    }
+
+    /// Bridge fields (v3), written from the control tick. Relaxed atomics only.
+    pub fn set_bridge(&self, r: &BridgeReport) {
+        self.a32(offset_of!(StatusBlock, bridge_attached)).store(r.attached, Relaxed);
+        self.a32(offset_of!(StatusBlock, vbmatrix_running)).store(r.vbmatrix_running, Relaxed);
+        self.a32(offset_of!(StatusBlock, bridge_sample_rate)).store(r.sample_rate, Relaxed);
+        self.a32(offset_of!(StatusBlock, bridge_buffer_frames)).store(r.buffer_frames, Relaxed);
+        self.a32(offset_of!(StatusBlock, fill_a)).store(r.fill_a, Relaxed);
+        self.a32(offset_of!(StatusBlock, fill_b)).store(r.fill_b, Relaxed);
+        self.a32(offset_of!(StatusBlock, a_overruns)).store(r.a_overruns, Relaxed);
+        self.a32(offset_of!(StatusBlock, a_discarded)).store(r.a_discarded, Relaxed);
+        self.a32(offset_of!(StatusBlock, b_underruns)).store(r.b_underruns, Relaxed);
+        self.a32(offset_of!(StatusBlock, b_dropped)).store(r.b_dropped, Relaxed);
     }
 
     /// Audio-thread update: bumps `callbacks` and stores this block's figures
@@ -301,6 +346,18 @@ mod tests {
         w.set_capture_period_us(5000);
         w.set_safety_buffer_us(4000);
         w.set_effective_rate(44100);
+        w.set_bridge(&BridgeReport {
+            attached: 1,
+            vbmatrix_running: 1,
+            sample_rate: 96000,
+            buffer_frames: 256,
+            fill_a: 1024,
+            fill_b: 512,
+            a_overruns: 7,
+            a_discarded: 8,
+            b_underruns: 9,
+            b_dropped: 10,
+        });
         assert_eq!(unsafe { core::ptr::read_volatile(&blk.running) }, 1);
         drop(w);
         assert!(blk.is_valid());
@@ -314,6 +371,10 @@ mod tests {
         assert_eq!((blk.underruns, blk.overruns, blk.max_callback_us, blk.avg_callback_us), (2, 3, 900, 120));
         assert_eq!((blk.capture_period_us, blk.safety_buffer_us, blk.effective_rate), (5000, 4000, 44100));
         assert_eq!(blk.dropped_logs, u32::MAX);
+        assert_eq!((blk.bridge_attached, blk.vbmatrix_running), (1, 1));
+        assert_eq!((blk.bridge_sample_rate, blk.bridge_buffer_frames), (96000, 256));
+        assert_eq!((blk.fill_a, blk.fill_b), (1024, 512));
+        assert_eq!((blk.a_overruns, blk.a_discarded, blk.b_underruns, blk.b_dropped), (7, 8, 9, 10));
     }
 
     #[test]

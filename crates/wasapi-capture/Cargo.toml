@@ -13,6 +13,7 @@ name = "capture-probe"
 path = "src/bin/capture_probe.rs"
 
 [dependencies]
+router-core = { path = "../router-core" }
 thiserror.workspace = true
 windows-core = "0.62"
 windows = { workspace = true, features = [

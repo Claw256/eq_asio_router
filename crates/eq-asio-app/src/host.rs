@@ -1,7 +1,7 @@
 //! Worker thread that owns the [`Engine`] so the UI thread never blocks on it.
 
 use eq_core::{Caps, Config};
-use router_engine::{ApplyOutcome, Engine, EngineError, EngineOptions, EngineStatus, SourceReadiness};
+use router_engine::{ApplyOutcome, Engine, EngineError, EngineOptions, EngineStatus};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -25,10 +25,6 @@ pub struct Snapshot {
     pub start_error: Option<EngineError>,
     /// Last `apply` result text.
     pub last_apply: Option<String>,
-    /// Last read-only source readiness check (see [`EngineHost::request_readiness`]).
-    pub readiness: Option<SourceReadiness>,
-    /// A readiness check is running on its own thread.
-    pub readiness_busy: bool,
 }
 
 enum Cmd {
@@ -37,7 +33,6 @@ enum Cmd {
     Apply(Config),
     Restart,
     RetryNow,
-    ResetFallback,
     Learn,
     Shutdown,
 }
@@ -109,11 +104,6 @@ impl EngineHost {
                                 e.learn_jitter();
                             }
                         }
-                        Ok(Cmd::ResetFallback) => {
-                            if let Some(e) = &engine {
-                                e.reset_fallback();
-                            }
-                        }
                         Ok(Cmd::RetryNow) => {
                             if let Some(e) = &engine {
                                 e.retry_now();
@@ -171,37 +161,7 @@ impl EngineHost {
         let _ = self.tx.send(Cmd::Restart);
     }
 
-    /// Forgets a corruption fallback and retries fixed-period capture (restarts the stream).
-    pub fn reset_fallback(&self) {
-        let _ = self.tx.send(Cmd::ResetFallback);
-    }
-
-    /// Runs the read-only source readiness check on its own thread (never blocks the UI or the
-    /// engine worker); the result appears in `Snapshot::readiness`. Ignored while one is running.
-    pub fn request_readiness(&self, cfg: Config) {
-        {
-            let mut g = lock(&self.shared);
-            if g.readiness_busy {
-                return;
-            }
-            g.readiness_busy = true;
-        }
-        let sh = self.shared.clone();
-        let spawned = std::thread::Builder::new().name("readiness".into()).spawn({
-            let sh = sh.clone();
-            move || {
-                let r = router_engine::source_readiness(&cfg);
-                let mut g = lock(&sh);
-                g.readiness = Some(r);
-                g.readiness_busy = false;
-            }
-        });
-        if spawned.is_err() {
-            lock(&sh).readiness_busy = false;
-        }
-    }
-
-    /// Starts the engine's 30 s arrival-jitter measurement ("Learn").
+    /// Starts the engine's 30 s source-jitter measurement ("Learn").
     pub fn learn(&self) {
         let _ = self.tx.send(Cmd::Learn);
     }

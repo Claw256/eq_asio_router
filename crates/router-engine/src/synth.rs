@@ -1,9 +1,9 @@
-//! Synthetic capture source for hardware measurements: stands in for the WASAPI capture of
-//! the cable so the real pipeline + ASIO device can be exercised at any cable rate / packet
-//! size / burst jitter without touching the Windows audio settings.
+//! Synthetic source for hardware measurements: stands in for the bridge so the real
+//! pipeline + ASIO device can be exercised at any source rate / packet size / burst jitter
+//! without touching VBMatrix or the Windows audio settings.
 //!
 //! The source produces a continuous multi-tone (or single sine) in real time on its own
-//! thread and delivers it through the same [`FrameSink`] the real capture uses.
+//! thread and pushes it into the pipeline's in-process ring through [`SynthFeeder`].
 
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use wasapi_capture::FrameSink;
+use crate::pipeline::SynthFeeder;
 
 /// Description of the synthetic source.
 #[derive(Clone, Debug)]
@@ -61,7 +61,7 @@ impl Drop for SynthHandle {
 }
 
 /// Spawns the source thread.
-pub fn spawn(cfg: SyntheticSource, mut sink: Box<dyn FrameSink>) -> std::io::Result<SynthHandle> {
+pub fn spawn(cfg: SyntheticSource, mut sink: SynthFeeder) -> std::io::Result<SynthHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let s2 = stop.clone();
     let thread = std::thread::Builder::new().name("router-synth".into()).spawn(move || {
@@ -70,7 +70,7 @@ pub fn spawn(cfg: SyntheticSource, mut sink: Box<dyn FrameSink>) -> std::io::Res
         unsafe {
             timeBeginPeriod(1);
         }
-        run(&cfg, &mut *sink, &s2);
+        run(&cfg, &mut sink, &s2);
         // SAFETY: matches the call above.
         unsafe {
             timeEndPeriod(1);
@@ -79,7 +79,7 @@ pub fn spawn(cfg: SyntheticSource, mut sink: Box<dyn FrameSink>) -> std::io::Res
     Ok(SynthHandle { stop, thread: Some(thread) })
 }
 
-fn run(cfg: &SyntheticSource, sink: &mut dyn FrameSink, stop: &AtomicBool) {
+fn run(cfg: &SyntheticSource, sink: &mut SynthFeeder, stop: &AtomicBool) {
     let n = cfg.packet_frames.max(1) as usize;
     let rate = f64::from(cfg.rate);
     let amp = 10f64.powf(f64::from(cfg.dbfs) / 20.0) / cfg.freqs.len().max(1) as f64;

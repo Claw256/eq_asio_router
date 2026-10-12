@@ -239,7 +239,7 @@ pub extern "system" fn DllRegisterServer() -> i32 {
         let clsid = clsid_string();
         let ok = write_key(&clsid_key_path(), &[(None, DRIVER_DESCRIPTION)])
             && write_key(&inproc_key_path(), &[(None, &dll), (Some("ThreadingModel"), "Apartment")])
-            && write_key(&asio_key_path(), &[(Some("CLSID"), &clsid), (Some("Description"), DRIVER_NAME)]);
+            && write_key(&asio_key_path(), &[(Some("CLSID"), &clsid), (Some("Description"), DRIVER_DESCRIPTION)]);
         crate::dlog!("DllRegisterServer({dll}) -> {ok}");
         if ok {
             S_OK

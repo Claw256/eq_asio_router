@@ -4,6 +4,7 @@ members = [
     "crates/asio-abi",
     "crates/asio-host",
     "crates/asio-probe",
+    "crates/bridge-abi",
     "crates/eq-core",
     "crates/eq-asio-driver",
     "crates/eq-asio-app",
@@ -27,6 +28,7 @@ toml = "0.8"
 windows = "0.62"
 asio-abi = { path = "crates/asio-abi" }
 asio-host = { path = "crates/asio-host" }
+bridge-abi = { path = "crates/bridge-abi" }
 eq-core = { path = "crates/eq-core" }
 
 [profile.release]

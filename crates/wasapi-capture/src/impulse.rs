@@ -9,15 +9,14 @@
 //! * The pure part ([`click_samples`], [`ImpulseTrain`], [`onset_index`], [`validate_peak_dbfs`])
 //!   has no COM and is unit-tested.
 //! * Safety: a click louder than [`MAX_IMPULSE_DBFS`] (-35 dBFS peak) is refused, and the sink must be
-//!   a known virtual cable ([`is_sink_allowed`]) unless the caller passes an explicit allow-list entry.
-//!   The test signal is silence apart from the click.
+//!   a known virtual cable or a VBMatrix render endpoint ([`is_sink_allowed"]) unless the caller passes
+//!   an explicit allow-list entry. The test signal is silence apart from the click.
 
 use crate::convert::{write_sample, FormatInfo};
 use crate::device::{activate_client, find_device, open_device, ComGuard, Flow, MixFormat};
 use crate::keepalive::is_virtual_cable_name;
 use crate::loopback::current_engine_period;
 use crate::{CaptureError, Result};
-use std::f64::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -42,6 +41,10 @@ pub const DEFAULT_IMPULSE_DBFS: f32 = -40.0;
 /// Quietest click accepted (below this the detection thresholds of the measurement are meaningless).
 pub const MIN_IMPULSE_DBFS: f32 = -80.0;
 
+// The pure signal maths lives in `router-core` (shared with `router-engine`, which must not depend on
+// this crate); re-exported here so the existing `crate::impulse::*` paths keep working.
+pub use router_core::click::{click_samples, onset_index, ImpulseShape};
+
 /// `QueryPerformanceCounter` ticks (the same clock as the engine's callbacks).
 pub fn qpc_ticks() -> i64 {
     let mut t = 0i64;
@@ -63,52 +66,8 @@ pub fn qpc_hz() -> i64 {
 }
 
 // ------------------------------------------------------------------------------------
-// Pure signal part
+// Pure signal part (see the `router_core::click` re-export above)
 // ------------------------------------------------------------------------------------
-
-/// Shape of one injected impulse.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ImpulseShape {
-    /// Raised-cosine windowed burst of a sine (default 2 ms of 1.5 kHz: survives EQ and limiter).
-    Burst { freq_hz: f32, dur_ms: f32 },
-    /// Raised-cosine windowed linear chirp.
-    Chirp { f0_hz: f32, f1_hz: f32, dur_ms: f32 },
-}
-
-impl Default for ImpulseShape {
-    fn default() -> Self {
-        ImpulseShape::Burst { freq_hz: 1500.0, dur_ms: 2.0 }
-    }
-}
-
-impl ImpulseShape {
-    /// Parses "burst", "burst:FREQ[:MS]", "chirp", "chirp:F0:F1[:MS]".
-    pub fn parse(s: &str) -> Option<Self> {
-        let mut it = s.split(':');
-        match it.next()? {
-            "burst" | "click" => {
-                let f: f32 = it.next().map(str::parse).transpose().ok()?.unwrap_or(1500.0);
-                let d: f32 = it.next().map(str::parse).transpose().ok()?.unwrap_or(2.0);
-                (f > 50.0 && f < 20000.0 && d > 0.2 && d <= 20.0).then_some(ImpulseShape::Burst { freq_hz: f, dur_ms: d })
-            }
-            "chirp" => {
-                let f0: f32 = it.next().map(str::parse).transpose().ok()?.unwrap_or(800.0);
-                let f1: f32 = it.next().map(str::parse).transpose().ok()?.unwrap_or(4000.0);
-                let d: f32 = it.next().map(str::parse).transpose().ok()?.unwrap_or(4.0);
-                (f0 > 50.0 && f1 > 50.0 && f0 < 20000.0 && f1 < 20000.0 && d > 0.5 && d <= 40.0)
-                    .then_some(ImpulseShape::Chirp { f0_hz: f0, f1_hz: f1, dur_ms: d })
-            }
-            _ => None,
-        }
-    }
-
-    /// Duration in milliseconds.
-    pub fn dur_ms(&self) -> f32 {
-        match *self {
-            ImpulseShape::Burst { dur_ms, .. } | ImpulseShape::Chirp { dur_ms, .. } => dur_ms,
-        }
-    }
-}
 
 /// Checks a requested peak level: finite, at most [`MAX_IMPULSE_DBFS`], at least [`MIN_IMPULSE_DBFS`].
 pub fn validate_peak_dbfs(dbfs: f32) -> std::result::Result<(), String> {
@@ -122,46 +81,6 @@ pub fn validate_peak_dbfs(dbfs: f32) -> std::result::Result<(), String> {
         return Err(format!("impulse level {dbfs} dBFS is below {MIN_IMPULSE_DBFS} dBFS: too quiet to detect"));
     }
     Ok(())
-}
-
-/// One click, mono, peak-normalised to exactly `peak_dbfs`. The first sample is 0 (the window starts at 0).
-pub fn click_samples(shape: ImpulseShape, rate: u32, peak_dbfs: f32) -> Vec<f32> {
-    let rate_f = f64::from(rate.max(8000));
-    let dur_s = f64::from(shape.dur_ms()) / 1000.0;
-    let n = ((dur_s * rate_f).round() as usize).max(8);
-    let mut v: Vec<f64> = (0..n)
-        .map(|i| {
-            let window = 0.5 * (1.0 - (2.0 * PI * i as f64 / n as f64).cos());
-            let t = i as f64 / rate_f;
-            let carrier = match shape {
-                ImpulseShape::Burst { freq_hz, .. } => (2.0 * PI * f64::from(freq_hz) * t).sin(),
-                ImpulseShape::Chirp { f0_hz, f1_hz, .. } => {
-                    let (f0, f1) = (f64::from(f0_hz), f64::from(f1_hz));
-                    (2.0 * PI * (f0 * t + (f1 - f0) * t * t / (2.0 * dur_s))).sin()
-                }
-            };
-            window * carrier
-        })
-        .collect();
-    let peak = v.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-12);
-    let amp = 10f64.powf(f64::from(peak_dbfs) / 20.0);
-    for x in v.iter_mut() {
-        *x *= amp / peak;
-    }
-    v.into_iter().map(|x| x as f32).collect()
-}
-
-/// Index of the first sample whose magnitude reaches `ratio` times the click's peak.
-///
-/// A threshold detector on the received signal fires this many samples after the click's first frame;
-/// subtracting it from the detected position references the measurement to the click's frame 0.
-pub fn onset_index(click: &[f32], ratio: f32) -> usize {
-    let peak = click.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-    if peak <= 0.0 {
-        return 0;
-    }
-    let thr = ratio.clamp(0.0, 1.0) * peak;
-    click.iter().position(|x| x.abs() >= thr).unwrap_or(0)
 }
 
 /// Pure generator of an impulse train (mono): silence, with a click every `interval` frames.
@@ -229,11 +148,22 @@ impl ImpulseTrain {
     }
 }
 
-/// True when `name` may be used as an injection sink: a known virtual cable, or matching an
-/// explicit allow-list entry (case-insensitive substring; empty entries never match).
+/// True for VBMatrix's render endpoints ("VBMatrix In 1", "VBMatrix In 3 (VB-Audio Matrix VAIO)", ...):
+/// audio played there is routed by VBMatrix into the virtual ASIO driver, so a quiet click injected
+/// there travels the whole router chain — the injection sink of `router-cli latency` since M3a, and
+/// what `capture-probe impulses` measures the engine periods of.
+pub fn is_vbmatrix_render_name(name: &str) -> bool {
+    name.trim().to_lowercase().starts_with("vbmatrix in")
+}
+
+/// True when `name` may be used as an injection sink: a known virtual cable, a VBMatrix render
+/// endpoint ("VBMatrix In *"), or matching an explicit allow-list entry (case-insensitive
+/// substring; empty entries never match).
 pub fn is_sink_allowed(name: &str, allow: &[String]) -> bool {
     let n = name.to_lowercase();
-    is_virtual_cable_name(name) || allow.iter().any(|a| !a.trim().is_empty() && n.contains(&a.trim().to_lowercase()))
+    is_virtual_cable_name(name)
+        || is_vbmatrix_render_name(name)
+        || allow.iter().any(|a| !a.trim().is_empty() && n.contains(&a.trim().to_lowercase()))
 }
 
 // ------------------------------------------------------------------------------------
@@ -864,6 +794,9 @@ mod tests {
     fn sink_guard() {
         assert!(is_sink_allowed("Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)", &[]));
         assert!(is_sink_allowed("Line 1 (Virtual Audio Cable)", &[]));
+        assert!(is_sink_allowed("VBMatrix In 3 (VB-Audio Matrix VAIO)", &[]), "bridge render endpoint");
+        assert!(is_sink_allowed("vbmatrix in 1", &[]));
+        assert!(!is_sink_allowed("VBMatrix Out 1", &[]), "only the In side is a render endpoint");
         assert!(!is_sink_allowed("Headphones (Yamaha UR22C)", &[]));
         assert!(!is_sink_allowed("Speakers (Realtek)", &[String::new(), "  ".into()]));
         assert!(is_sink_allowed("Speakers (Realtek)", &["realtek".to_string()]));

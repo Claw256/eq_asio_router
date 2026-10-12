@@ -101,10 +101,17 @@ impl ConfigWatcher {
                     let mtime = eq_core::modified(&path);
                     let rate = sample_rate.load(Ordering::Relaxed);
                     let sent = st.tick(&handoff, mtime, rate, &err2, || {
-                        Config::load(&path).map(|c| c.sanitized()).map_err(|e| {
-                            rlog!(Level::Warn, "config reload failed (keeping previous): {e}");
-                            e.to_string()
-                        })
+                        Config::load(&path)
+                            .map(|c| {
+                                if let Some(n) = eq_core::take_deprecation_notice() {
+                                    rlog!(Level::Warn, "{n}");
+                                }
+                                c.sanitized()
+                            })
+                            .map_err(|e| {
+                                rlog!(Level::Warn, "config reload failed (keeping previous): {e}");
+                                e.to_string()
+                            })
                     });
                     if sent {
                         pub2.fetch_add(1, Ordering::Relaxed);

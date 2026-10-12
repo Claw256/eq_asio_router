@@ -7,9 +7,9 @@ license.workspace = true
 [dependencies]
 asio-abi.workspace = true
 asio-host.workspace = true
+bridge-abi.workspace = true
 eq-core.workspace = true
 router-core = { path = "../router-core" }
-wasapi-capture = { path = "../wasapi-capture" }
 thiserror.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",

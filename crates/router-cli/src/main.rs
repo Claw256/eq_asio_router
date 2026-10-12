@@ -5,12 +5,11 @@
 //! router-cli caps [--master NAME]
 //! router-cli holders [--master NAME]
 //! router-cli --help | -h | help        (any subcommand too; unknown flags/subcommands exit 2 before any engine start)
-//! router-cli run (--seconds N | --forever) [--config PATH] [--master NAME] [--capture NAME] [--rate HZ]
-//!                [--safety-ms F] [--preamp-db F] [--bypass] [--mode shared|low|exclusive]
-//!                [--source vac|cable|custom] [--period-ms F] [--keepalive|--no-keepalive]
+//! router-cli run (--seconds N | --forever) [--config PATH] [--master NAME] [--rate HZ]
+//!                [--safety-ms F] [--preamp-db F] [--bypass] [--learn]
 //!                [--dump-dir DIR]
-//! router-cli latency [--sink NAME] [--count N] [--interval-ms M] [--db -40] [--config PATH] [--source vac|cable]
-//!                    [--no-match-cable] [--allow-sink NAME] [--shape burst:18500:2] [--hp-hz N|off] [--json]
+//! router-cli latency [--sink NAME] [--count N] [--interval-ms M] [--db -40] [--config PATH]
+//!                    [--allow-sink NAME] [--shape burst:18500:2] [--hp-hz N|off] [--json]
 //! router-cli latency --baseline [--seconds 3] [--dump FILE.wav] | --selftest
 //! router-cli analyze FILE [--freq HZ] [--skip S] [--tail S] [--channel N] [--mads X]
 //! ```
@@ -20,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use eq_core::{CaptureMode, Config};
+use eq_core::Config;
 use router_engine::{Engine, EngineOptions, EngineState, EngineStatus};
 use wasapi_capture::{list_endpoints, Flow};
 use windows::core::BOOL;
@@ -40,23 +39,19 @@ const USAGE: &str = "usage:
   router-cli caps [--master NAME]
   router-cli holders [--master NAME]
   router-cli --help | -h | help   (also after any subcommand; prints this text, exit 0; unknown flags/subcommands exit 2)
-  router-cli run (--seconds N | --forever) [--config PATH] [--master NAME] [--capture NAME] [--rate HZ]
-                 [--safety-ms F] [--preamp-db F] [--bypass] [--mode shared|low|exclusive]
-                 [--learn]   (after 5 s run the 30 s arrival-jitter measurement and print the learned margin)
-                 [--no-match-cable]   (do not change the Hi-Fi Cable's Windows rate to the Yamaha's)
-                 [--source vac|cable]   (preset: vac = Line 1 (Virtual Audio Cable), 6 ms fixed capture period,
-                                         render keep-alive, no Windows rate change; cable = Hi-Fi Cable defaults)
-                 [--period-ms F]   (fixed capture period for a virtual cable: 0 = driver default, else 5..20 ms; marks the source preset Custom)
-                 [--keepalive|--no-keepalive]   (silent render stream on the cable's playback endpoint -> 1 ms engine period; marks the source preset Custom)
+  router-cli run (--seconds N | --forever) [--config PATH] [--master NAME] [--rate HZ]
+                 [--safety-ms F] [--preamp-db F] [--bypass]
+                 [--learn]   (after 5 s run the 30 s source jitter measurement and print the learned margin)
                  [--dump-dir DIR]   (writes capture_in.wav, after_resample.wav, after_eq.wav)
                  [--synthetic RATE[:PACKET[:JITTER_MS[:FREQ,..]]] [--synthetic-db DB]]
   router-cli latency [--sink NAME] [--count N<=10] [--interval-ms M] [--db -40 (max -35)] [--config PATH]
-                     [--source vac|cable] [--no-match-cable] [--allow-sink NAME] [--shape burst|chirp] [--json]
+                     [--allow-sink NAME] [--shape burst|chirp] [--json]
                      [--cap-threshold-db X] [--lb-threshold-db X] [--hp-hz N|off]
-                     (end-to-end click latency: injects a very quiet click into the cable's playback endpoint and
-                      detects it on the Yamaha's loopback inputs; preamp forced to -20 dB, limiter on)
+                     (end-to-end click latency: injects a very quiet click into the VBMatrix render endpoint
+                      (VBMatrix In *) and detects it on the bridge source side (stage 1, ring-A tap) and on
+                      the Yamaha's loopback inputs (stage 2); preamp forced to -20 dB, limiter on)
   router-cli latency --baseline [--seconds 3 (0.5..10)] [--dump FILE.wav]
-                     (no click, nothing played: levels, DC, noise floor and spectrum at the capture sink and the Yamaha
+                     (no click, nothing played: levels, DC, noise floor and spectrum at the bridge source side and the Yamaha
                       loopback inputs, and whether a click would be detectable; use it when `latency` reports a noisy loopback)
   router-cli latency --selftest   (no hardware: validates the detection/timing maths on a synthetic loopback)
   router-cli analyze FILE [--freq HZ] [--skip S] [--tail S] [--channel N] [--mads X]
@@ -96,18 +91,11 @@ const RUN_FLAGS: &[(&str, bool)] = &[
     ("--seconds", true),
     ("--forever", false),
     ("--master", true),
-    ("--capture", true),
     ("--rate", true),
     ("--safety-ms", true),
     ("--preamp-db", true),
     ("--bypass", false),
-    ("--mode", true),
     ("--learn", false),
-    ("--no-match-cable", false),
-    ("--source", true),
-    ("--period-ms", true),
-    ("--keepalive", false),
-    ("--no-keepalive", false),
     ("--dump-dir", true),
     ("--synthetic", true),
     ("--synthetic-db", true),
@@ -118,8 +106,6 @@ const LATENCY_FLAGS: &[(&str, bool)] = &[
     ("--interval-ms", true),
     ("--db", true),
     ("--config", true),
-    ("--source", true),
-    ("--no-match-cable", false),
     ("--allow-sink", true),
     ("--shape", true),
     ("--hp-hz", true),
@@ -137,15 +123,10 @@ const LATENCY_FLAGS: &[(&str, bool)] = &[
     ("--render-fill", true),
     ("--render-prefill", true),
     ("--master", true),
-    ("--capture", true),
     ("--rate", true),
     ("--safety-ms", true),
     ("--preamp-db", true),
     ("--bypass", false),
-    ("--mode", true),
-    ("--period-ms", true),
-    ("--keepalive", false),
-    ("--no-keepalive", false),
 ];
 const MASTER_FLAGS: &[(&str, bool)] = &[("--master", true)];
 const ANALYZE_FLAGS: &[(&str, bool)] =
@@ -253,9 +234,6 @@ fn devices() -> Result<()> {
                     if e.is_default {
                         tags.push("default");
                     }
-                    if flow == Flow::Capture && e.name == eq_core::DEFAULT_CAPTURE_DEVICE {
-                        tags.push("engine default capture");
-                    }
                     let tag = if tags.is_empty() { String::new() } else { format!("  ({})", tags.join(", ")) };
                     let rate = if e.name.to_lowercase().contains("cable") {
                         match wasapi_capture::get_endpoint_device_format(&e.id) {
@@ -347,43 +325,15 @@ fn hardening_line(h: &router_engine::HardeningReport) -> String {
     format!("hardening: {}", h.summary())
 }
 
-/// Header lines about the capture source: period requested vs granted, fallback, keep-alive.
-fn capture_lines(s: &EngineStatus) -> Vec<String> {
+/// Header lines about the source: name, rate and period of the running session.
+fn source_lines(s: &EngineStatus) -> Vec<String> {
     let mut v = Vec::new();
     if s.cable_rate > 0 {
         let ms = f64::from(s.capture_period_us) / 1000.0;
         v.push(format!(
-            "capture: \"{}\" {} Hz, mode {} (requested {}), period {} fr ({ms:.1} ms), requested {}",
-            s.capture_device,
-            s.cable_rate,
-            s.capture_mode_in_use.map(|m| m.name()).unwrap_or("-"),
-            s.capture_mode_requested.map(|m| m.name()).unwrap_or("-"),
-            s.capture_period_frames_granted,
-            if s.capture_period_frames_requested == 0 {
-                "driver default".to_string()
-            } else {
-                format!("{} fr", s.capture_period_frames_requested)
-            },
+            "source: \"{}\" {} Hz, period {} fr ({ms:.1} ms)",
+            s.source_name, s.cable_rate, s.capture_period_frames,
         ));
-    }
-    if let Some(n) = &s.capture_note {
-        v.push(format!("capture note: {n}"));
-    }
-    if let Some(f) = &s.capture_fallback {
-        v.push(format!("WARNING: {f}"));
-    }
-    match (&s.keepalive, &s.keepalive_note) {
-        (Some(k), _) => {
-            let ms = |p: Option<f32>| p.map(|v| format!("{v:.1} ms")).unwrap_or_else(|| "?".into());
-            v.push(format!(
-                "keep-alive: on \"{}\", engine period {} -> {}",
-                k.render_name,
-                ms(k.engine_period_before_ms),
-                ms(k.engine_period_after_ms)
-            ));
-        }
-        (None, Some(n)) => v.push(format!("keep-alive: {n}")),
-        (None, None) => {}
     }
     v
 }
@@ -394,9 +344,9 @@ fn status_line(t: f64, s: &EngineStatus, peak_in: [f32; 2], peak_out: [f32; 2]) 
         EngineState::WaitingForDevice { holders } => format!("WaitingForDevice({})", holders.len()),
         other => format!("{other:?}"),
     };
-    let mode = s.capture_mode_in_use.map(|m| format!("{m:?}")).unwrap_or_else(|| "-".into());
     format!(
-        "[{t:4.0}s] {state} | cable {} Hz ({mode}, {:.1} ms period) -> asio {} Hz buf {} | ring {}/{} fr | under {} over {} xrun {} discarded {} | capture pk {} disc {} silent {} | fault {:?} | cpu {:.2}% (max {:.2}%, {:.0}/{:.0} us) | peak in {} / out {} dBFS | lat {:.1} ms (out {:.1} + ring {:.1} + cap {:.1} + render {:.0} {}) | ring mean {} fr, headroom {}/{} fr, arrival p99.9 gap {:.1} ms dip {} fr | safety {:.1} ms drift {:+.0} ppm | src {} period {}/{} fr keepalive {}{}",
+        "[{t:4.0}s] {state} | {} {} Hz ({:.1} ms period) -> asio {} Hz buf {} | ring {}/{} fr | under {} over {} xrun {} discarded {} | fault {:?} | cpu {:.2}% (max {:.2}%, {:.0}/{:.0} us) | peak in {} / out {} dBFS | lat {:.1} ms (out {:.1} + ring {:.1} + cap {:.1} + render {:.0} {}) | ring mean {} fr, headroom {}/{} fr, arrival p99.9 gap {:.1} ms dip {} fr | safety {:.1} ms drift {:+.0} ppm",
+        s.source_name,
         s.cable_rate,
         f64::from(s.capture_period_us) / 1000.0,
         s.asio_rate,
@@ -407,9 +357,6 @@ fn status_line(t: f64, s: &EngineStatus, peak_in: [f32; 2], peak_out: [f32; 2]) 
         s.overruns,
         s.xruns,
         s.discarded_frames,
-        s.capture_packets,
-        s.capture_discontinuities,
-        s.capture_silent_packets,
         s.fault,
         s.cpu_avg_pct,
         s.cpu_max_pct,
@@ -430,69 +377,29 @@ fn status_line(t: f64, s: &EngineStatus, peak_in: [f32; 2], peak_out: [f32; 2]) 
         s.arrival_dip_p999_frames,
         s.safety_buffer_ms,
         s.drift_ppm,
-        s.source_preset.label(),
-        s.capture_period_frames_granted,
-        s.capture_period_frames_requested,
-        if s.keepalive.is_some() { "on" } else { "off" },
-        if s.capture_fallback.is_some() { " FALLBACK" } else { "" },
     )
 }
 
-/// Builds the run configuration from the config file and the shared flags (`--config`, `--source`, `--master`,
-/// `--capture`, `--period-ms`, `--keepalive`, `--rate`, `--safety-ms`, `--preamp-db`, `--no-match-cable`, `--bypass`,
-/// `--mode`); used by `run` and `latency`.
+/// Builds the run configuration from the config file and the shared flags (`--config`, `--master`,
+/// `--rate`, `--safety-ms`, `--preamp-db`, `--bypass`); used by `run` and `latency`.
 fn build_run_config(args: &[String]) -> Result<(Config, Option<PathBuf>)> {
     let cfg_path: Option<PathBuf> = match opt(args, "--config")? {
         Some(p) => Some(PathBuf::from(p)),
         None => eq_core::default_path().filter(|p| p.exists()),
     };
     let mut cfg = match &cfg_path {
-        Some(p) if p.exists() => Config::load(p).with_context(|| format!("loading {}", p.display()))?.sanitized(),
+        Some(p) if p.exists() => {
+            let c = Config::load(p).with_context(|| format!("loading {}", p.display()))?;
+            if let Some(n) = eq_core::take_deprecation_notice() {
+                println!("note: {n}");
+            }
+            c.sanitized()
+        }
         Some(p) => bail!("config file {} does not exist", p.display()),
         None => Config::default(),
     };
-    // Source preset first, so the explicit flags below can still override single values.
-    let source = opt(args, "--source")?;
-    if let Some(src) = source {
-        let preset = eq_core::SourcePreset::parse(src).ok_or_else(|| anyhow!("unknown --source {src} (vac|cable|custom)"))?;
-        if preset == eq_core::SourcePreset::Custom {
-            cfg.source_preset = eq_core::SourcePreset::Custom; // keep the file's values untouched
-        } else {
-            cfg.apply_source_preset(preset);
-        }
-    }
-    let mode_in_file = cfg_path
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .is_some_and(|t| t.contains("capture_mode"));
-    if !mode_in_file {
-        // The cable gains nothing from IAudioClient3 low-latency mode (measured): plain shared.
-        cfg.capture_mode = CaptureMode::Shared;
-    }
-    let mut overridden = false;
     if let Some(m) = opt(args, "--master")? {
         cfg.master_driver = m.to_string();
-    }
-    if let Some(c) = opt(args, "--capture")? {
-        cfg.capture_device = c.to_string();
-        overridden = true;
-    }
-    if let Some(p) = opt(args, "--period-ms")? {
-        cfg.capture_period_ms = p.parse().context("--period-ms")?;
-        overridden = true;
-    }
-    if args.iter().any(|a| a == "--keepalive") {
-        cfg.render_keepalive = true;
-        overridden = true;
-    }
-    if args.iter().any(|a| a == "--no-keepalive") {
-        cfg.render_keepalive = false;
-        overridden = true;
-    }
-    // Any override of a preset-owned value (capture device, period, keep-alive) means the settings no
-    // longer match the named preset, even when `--source` was given together with it.
-    if overridden {
-        cfg.source_preset = eq_core::SourcePreset::Custom;
     }
     if let Some(r) = opt(args, "--rate")? {
         cfg.sample_rate = r.parse().context("--rate")?;
@@ -503,19 +410,8 @@ fn build_run_config(args: &[String]) -> Result<(Config, Option<PathBuf>)> {
     if let Some(p) = opt(args, "--preamp-db")? {
         cfg.profile.preamp_db = p.parse().context("--preamp-db")?;
     }
-    if args.iter().any(|a| a == "--no-match-cable") {
-        cfg.match_cable_rate = false;
-    }
     if args.iter().any(|a| a == "--bypass") {
         cfg.bypass = true;
-    }
-    if let Some(m) = opt(args, "--mode")? {
-        cfg.capture_mode = match m {
-            "shared" => CaptureMode::Shared,
-            "low" | "lowlatency" | "low-latency" => CaptureMode::LowLatency,
-            "exclusive" => CaptureMode::Exclusive,
-            other => bail!("unknown --mode {other} (shared|low|exclusive)"),
-        };
     }
     Ok((cfg.sanitized(), cfg_path))
 }
@@ -524,21 +420,8 @@ fn run(args: &[String]) -> Result<()> {
     let (cfg, cfg_path) = build_run_config(args)?;
     let seconds: Option<f64> = opt(args, "--seconds")?.map(str::parse).transpose().context("--seconds")?;
     println!(
-        "source {}: capture period {}  render keep-alive {}  cable-rate matching {}",
-        cfg.source_preset.label(),
-        if cfg.capture_period_ms > 0.0 {
-            format!("{:.1} ms (fixed, virtual cables only)", cfg.capture_period_ms)
-        } else {
-            "driver default".to_string()
-        },
-        if cfg.render_keepalive { "on" } else { "off" },
-        if cfg.match_cable_rate { "on" } else { "off" },
-    );
-    println!(
-        "master \"{}\"  capture \"{}\" ({:?})  rate {}  preamp {:+.1} dB  bypass {}  limiter {}  safety {:.1} ms{}  filters {}",
+        "master \"{}\"  rate {}  preamp {:+.1} dB  bypass {}  limiter {}  safety {:.1} ms{}  filters {}",
         if cfg.master_driver.is_empty() { "(default)" } else { &cfg.master_driver },
-        cfg.capture_device,
-        cfg.capture_mode,
         if cfg.sample_rate == 0 { "keep".to_string() } else { cfg.sample_rate.to_string() },
         cfg.profile.preamp_db,
         cfg.bypass,
@@ -578,15 +461,18 @@ fn run(args: &[String]) -> Result<()> {
     };
     let engine = Engine::start_with(cfg, opts).map_err(|e| anyhow!("{e}"))?;
     let started = engine.status();
-    match (&started.cable_rate_note, started.cable_rate) {
-        (Some(n), _) => println!("cable: {n}"),
-        (None, 0) => {}
-        (None, r) => println!(
-            "cable: {r} Hz{}",
-            if r == started.asio_rate || started.asio_rate == 0 { " (matches the Yamaha)" } else { " (differs from the Yamaha; resampling)" }
-        ),
+    if started.cable_rate > 0 {
+        println!(
+            "rate: {} Hz{}",
+            started.cable_rate,
+            if started.cable_rate == started.asio_rate || started.asio_rate == 0 {
+                " (matches the Yamaha)".to_string()
+            } else {
+                " (differs from the Yamaha; resampling)".to_string()
+            }
+        );
     }
-    for l in capture_lines(&started) {
+    for l in source_lines(&started) {
         println!("{l}");
     }
     println!("{}", hardening_line(&started.hardening));
@@ -618,7 +504,7 @@ fn run(args: &[String]) -> Result<()> {
         }
         if learn && learn_started && !s.learn.active && s.learn.finished > 0 {
             match (&s.learn.result_ms, &s.learn.error) {
-                (Some(ms), _) => println!("learn: lowest safe jitter margin {ms:.1} ms (store it with Config::set_jitter_margin: jitter_margin_by_device[\"<capture device>\"] = {ms:.1})"),
+                (Some(ms), _) => println!("learn: lowest safe jitter margin {ms:.1} ms (stored with Config::set_jitter_margin; on-disk key jitter_margin_by_device[\"vbmatrix\"] = {ms:.1})"),
                 (_, Some(e)) => println!("learn failed: {e}"),
                 _ => {}
             }
@@ -672,16 +558,6 @@ fn run(args: &[String]) -> Result<()> {
     if let Some(e) = last.last_error {
         println!("last error: {e}");
     }
-    if let Some(e) = last.capture_error {
-        println!("capture note: {e}");
-    }
-    if let Some(f) = last.capture_fallback {
-        println!("capture fallback: {f}");
-    }
-    println!(
-        "capture: {} packets, {} discontinuity flags, {} silent packets",
-        last.capture_packets, last.capture_discontinuities, last.capture_silent_packets
-    );
     println!("engine stopped; master released");
     if let Some(d) = &dump_dir {
         match router_engine::tap::read_report(d) {
@@ -743,23 +619,38 @@ mod tests {
     }
 
     #[test]
-    fn preset_flag_alone_keeps_preset() {
-        assert_eq!(cfg_from(&["--source", "vac"]).source_preset, eq_core::SourcePreset::Vac);
-        assert_eq!(cfg_from(&["--source", "cable"]).source_preset, eq_core::SourcePreset::Cable);
-    }
-
-    #[test]
-    fn overrides_mark_custom() {
-        for extra in [&["--period-ms", "8"][..], &["--keepalive"], &["--no-keepalive"]] {
-            let mut a = vec!["--source", "vac"];
-            a.extend_from_slice(extra);
-            assert_eq!(cfg_from(&a).source_preset, eq_core::SourcePreset::Custom, "{extra:?}");
-            assert_eq!(cfg_from(extra).source_preset, eq_core::SourcePreset::Custom, "{extra:?}");
+    fn removed_capture_flags_are_rejected() {
+        // M3a hard cutover: the WASAPI-era source flags no longer exist.
+        for a in [
+            &["--source", "vac"][..],
+            &["--capture", "X"][..],
+            &["--period-ms", "6"][..],
+            &["--keepalive"][..],
+            &["--no-keepalive"][..],
+            &["--mode", "shared"][..],
+            &["--no-match-cable"][..],
+        ] {
+            let mut args = vec!["--forever"];
+            args.extend_from_slice(a);
+            assert!(p(&args).is_err(), "run {a:?} must be rejected");
+            assert!(p(&["latency"]).is_ok());
+            let mut l = vec!["latency"];
+            l.extend_from_slice(a);
+            assert!(p(&l).is_err(), "latency {a:?} must be rejected");
         }
     }
 
     fn p(args: &[&str]) -> Result<Command, String> {
         parse_command(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn shared_overrides_apply() {
+        assert_eq!(cfg_from(&["--master", "Other ASIO"]).master_driver, "Other ASIO");
+        assert_eq!(cfg_from(&["--rate", "96000"]).sample_rate, 96000);
+        assert_eq!(cfg_from(&["--safety-ms", "7"]).safety_buffer_ms, 7.0);
+        assert!(cfg_from(&["--bypass"]).bypass);
+        assert!(!cfg_from(&[]).bypass);
     }
 
     #[test]
@@ -790,7 +681,7 @@ mod tests {
     #[test]
     fn unbounded_run_needs_forever() {
         assert!(p(&["run"]).is_err());
-        assert!(p(&["run", "--source", "vac", "--learn"]).is_err());
+        assert!(p(&["run", "--learn"]).is_err());
         assert_eq!(p(&["run", "--forever"]), Ok(Command::Run));
         assert_eq!(p(&["run", "--seconds", "30", "--preamp-db", "-20"]), Ok(Command::Run));
         assert!(p(&["run", "--seconds", "3", "--forever"]).is_err());
@@ -802,12 +693,7 @@ mod tests {
         assert_eq!(p(&["caps", "--master", "X"]), Ok(Command::Caps));
         assert_eq!(p(&["holders"]), Ok(Command::Holders));
         assert_eq!(p(&["analyze", "f.wav", "--freq", "1000"]), Ok(Command::Analyze));
-        assert_eq!(p(&["latency", "--source", "vac", "--shape", "burst:18500:2", "--db", "-35", "--json"]), Ok(Command::Latency));
+        assert_eq!(p(&["latency", "--shape", "burst:18500:2", "--db", "-35", "--json"]), Ok(Command::Latency));
         assert_eq!(p(&["latency", "--baseline"]), Ok(Command::Latency));
-    }
-
-    #[test]
-    fn source_custom_is_accepted() {
-        assert_eq!(cfg_from(&["--source", "custom"]).source_preset, eq_core::SourcePreset::Custom);
     }
 }

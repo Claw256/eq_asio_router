@@ -483,6 +483,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-abi"
+version = "0.2.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -975,6 +982,7 @@ name = "eq-asio-app"
 version = "0.2.0"
 dependencies = [
  "asio-host",
+ "bridge-abi",
  "eframe",
  "egui",
  "egui_plot",
@@ -983,7 +991,6 @@ dependencies = [
  "router-engine",
  "serde",
  "toml",
- "wasapi-capture",
  "windows",
 ]
 
@@ -992,8 +999,7 @@ name = "eq-asio-driver"
 version = "0.2.0"
 dependencies = [
  "asio-abi",
- "asio-host",
- "eq-core",
+ "bridge-abi",
  "windows",
 ]
 
@@ -2520,10 +2526,10 @@ version = "0.2.0"
 dependencies = [
  "asio-abi",
  "asio-host",
+ "bridge-abi",
  "eq-core",
  "router-core",
  "thiserror 2.0.21",
- "wasapi-capture",
  "windows",
 ]
 
@@ -3137,6 +3143,7 @@ dependencies = [
 name = "wasapi-capture"
 version = "0.2.0"
 dependencies = [
+ "router-core",
  "thiserror 2.0.21",
  "windows",
  "windows-core",
