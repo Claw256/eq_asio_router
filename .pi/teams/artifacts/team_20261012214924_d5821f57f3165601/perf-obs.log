@@ -1,6 +1,0 @@
-[2026-10-12T21:53:31.551Z] startPerfSampler entered (team=research observability=true importMetaUrl=file:///C:/Users/Rexami/.pi/agent/npm/node_modules/pi-crew/dist/index.mjs)
-[2026-10-12T21:53:31.551Z] spawning sampler from C:\Users\Rexami\.pi\agent\npm\node_modules\pi-crew\scripts\resource-sampler.mjs
-[resource-sampler] writing → C:\Projects\eq_asio_router\.pi\teams\artifacts\team_20261012214924_d5821f57f3165601\resources.jsonl
-[resource-sampler] --watch-run team_20261012214924_d5821f57f3165601 → runner PID 28568
-[resource-sampler] ⚠️ LIVE 21:53:31 proc_died pid=28568 (root): watched PID 28568 no longer alive
-[resource-sampler] watched PID 28568 gone — stopping
