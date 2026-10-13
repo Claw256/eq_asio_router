@@ -29,7 +29,7 @@ pub mod windows;
 pub const BACKEND_NAME: &str = {
     #[cfg(all(target_os = "windows", feature = "backend-windows"))]
     {
-        "windows (asio-host stub)"
+        "windows (asio-host)"
     }
     #[cfg(all(target_os = "linux", feature = "backend-linux"))]
     {

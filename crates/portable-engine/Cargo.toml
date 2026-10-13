@@ -19,11 +19,19 @@ thiserror.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 # B2 fills (Phase B) — expected to stay empty for raw Core Audio FFI.
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Phase C: the Windows OutputSink wraps the existing asio-host crate (registry + COM
+# + IASIO wrapper); `windows` only names HWND in AsioDriver::load_diagnosed. The
+# windows crate has no build.rs probes, so the A7 cross-target check gate holds.
+asio-host.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation"] }
+
 [features]
-default = []
-# CI slicing (A6): each backend module compiles only when its feature is on AND the
-# target OS matches (see src/backend/mod.rs). Off by default so the workspace builds
-# everywhere before Phase B/C land their backend files.
+# Phase C (deviation D2): the three backend features are ON by default (each module
+# is still cfg-gated per target OS, see src/backend/mod.rs), so the fixed, flag-free
+# gates (`cargo build --workspace --all-targets`, `cargo check -p portable-engine
+# --target …`) actually compile the backend for the target under test.
+default = ["backend-linux", "backend-macos", "backend-windows"]
 backend-linux = []
 backend-macos = []
 backend-windows = []

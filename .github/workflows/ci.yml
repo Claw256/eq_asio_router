@@ -21,3 +21,49 @@ jobs:
         run: cargo build --workspace --release
       - name: Test
         run: cargo test --workspace --release
+
+  # Phase C matrix (docs/plans/cross-platform.md): the portable engine on all three
+  # OSes. Deviation D1: `--workspace` build/test run on windows-latest only —
+  # wasapi-capture / eq-asio-driver / router-engine / eq-asio-app / router-cli are
+  # unconditionally Win32 (A1 evidence), so a whole-workspace build cannot link on
+  # Linux/macOS without out-of-scope cfg-gating of those crates. The ubuntu/macos
+  # legs run the portable-engine-scoped equivalents (check + portable-cli selftest).
+  portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install ALSA/Pulse headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpulse-dev
+
+      # Windows: full workspace gates + the fake-driven selftest.
+      - name: Build workspace
+        if: runner.os == 'Windows'
+        run: cargo build --workspace --all-targets
+      - name: Test workspace
+        if: runner.os == 'Windows'
+        run: cargo test --workspace
+      - name: portable-cli selftest
+        if: runner.os == 'Windows'
+        run: cargo run -p portable-engine --bin portable-cli -- --selftest
+
+      # Linux/macOS: portable-engine scoped (the B1/B2 backends + headless CLI).
+      - name: Check portable-engine
+        if: runner.os != 'Windows'
+        run: cargo check -p portable-engine
+      - name: Build portable-cli
+        if: runner.os != 'Windows'
+        run: cargo build -p portable-engine --bin portable-cli
+      - name: Test portable-engine
+        if: runner.os != 'Windows'
+        run: cargo test -p portable-engine
+      - name: portable-cli selftest
+        if: runner.os != 'Windows'
+        run: cargo run -p portable-engine --bin portable-cli -- --selftest

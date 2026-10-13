@@ -17,7 +17,7 @@ pub use measured::{
 };
 pub use config::{
     default_path, frames_for_ms, modified, take_deprecation_notice, BridgeConfig, BRIDGE_SOURCE_KEY, Config, ConfigError,
-    JblLfoTarget, JblParams, JblPreset, jbl_presets, REMOVED_CONFIG_KEYS, ResamplerQuality,
+    JblLfoTarget, JblParams, JblPreset, jbl_presets, PortableConfig, REMOVED_CONFIG_KEYS, ResamplerQuality,
 };
 pub use dsp::{
     auto_headroom_db, magnitude_response_db, BassFx, Biquad, FaultConfig, FaultDetector, FaultState, FilterKind,

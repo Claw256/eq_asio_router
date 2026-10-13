@@ -2,186 +2,30 @@
 //! style as `router-engine/src/pipeline_tests.rs`): a synthetic tone leaves a fake
 //! [`SystemSource`], travels ring -> matcher -> EQ and lands in a fake
 //! [`OutputSink`]. No hardware, no OS calls — the seams are exercised through
-//! `FakeSource` / `FakeSink` / `NullTransport` / `InProcTransport` / `TestClock`.
+//! `FakeSource` / `FakeSink` / `NullTransport` / `InProcTransport` / `TestClock`
+//! (the fakes live in [`crate::testing`] since Phase C, shared with `--selftest`).
 
 use std::f64::consts::PI;
-use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use eq_core::{Config, EqProfile, FilterKind, FilterSpec, ResamplerQuality};
-use router_core::arrival::{ArrivalSnapshot, ArrivalStats, ArrivalTracker};
+use router_core::arrival::ArrivalStats;
 use router_core::processor::{EqProcessor, Handoff, Snapshot};
 use router_core::resample::{RateMatcher, RateMatcherConfig};
-use router_core::ring::{self, Producer};
+use router_core::ring;
 use router_core::watchdog::Heartbeat;
 
 use crate::pipeline::{write_out, write_silence_out, Live, Pipeline, PipelineCallback, PipelineInit};
 use crate::session::{burst_estimate, plan_capacity, plan_target};
-use crate::seams::{Clock, OutputCallback, OutputSink, SinkError, SourceError, StreamRequest, StreamSpec, SystemSource};
+use crate::seams::{OutputSink, StreamRequest, SystemSource};
 use crate::status::{InProcTransport, NullTransport};
+use crate::testing::{
+    has_sentinel, spec_of, FakeCallback, FakeSink, FakeSource, TestClock, TICK_HZ,
+};
 
 const FRAMES: usize = 512;
 const OUT_RATE: u32 = 48000;
-const TICK_HZ: i64 = 1_000_000;
-
-/// Sentinel bits of an unwritten output sample (`0x5555_5555`, as in the template).
-const SENTINEL_BITS: u32 = 0x5555_5555;
-
-fn sentinel() -> f32 {
-    f32::from_bits(SENTINEL_BITS)
-}
-
-fn has_sentinel(buf: &[f32]) -> bool {
-    buf.iter().any(|&v| v.to_bits() == SENTINEL_BITS)
-}
-
-/// Identity mapping request -> granted spec (the fake grants exactly what is asked).
-fn spec_of(want: &StreamRequest) -> StreamSpec {
-    StreamSpec { rate_hz: want.rate_hz, buffer_frames: want.buffer_frames, channels: want.channels }
-}
-
-// ------------------------------------------------------------------------------------
-// Seam fakes
-// ------------------------------------------------------------------------------------
-
-/// Deterministic clock: `now` is set by the rig before each pump so the callback's
-/// self-timing is synthetic (300 us of pretended work per block).
-#[derive(Default)]
-struct TestClock {
-    now: AtomicI64,
-}
-
-impl Clock for TestClock {
-    fn now_ticks(&self) -> i64 {
-        self.now.load(Relaxed)
-    }
-    fn ticks_per_second(&self) -> i64 {
-        TICK_HZ
-    }
-    fn sleep_until(&self, _ticks: i64) {}
-}
-
-/// Fake [`SystemSource`]: pushes synthetic tone packets into the attached ring and
-/// feeds the arrival statistics, like a system tap would.
-struct FakeSource {
-    rate: u32,
-    ring: Option<Producer>,
-    arrival: ArrivalTracker,
-    hb: Arc<Heartbeat>,
-}
-
-impl FakeSource {
-    fn new(rate: u32, stats: Arc<ArrivalStats>, hb: Arc<Heartbeat>) -> Self {
-        FakeSource { rate, ring: None, arrival: ArrivalTracker::new(stats), hb }
-    }
-
-    /// Delivers one packet (producer side; not on any audio callback).
-    fn push(&mut self, t_s: f64, l: &[f32], r: &[f32]) {
-        self.hb.beat_capture();
-        self.arrival.on_frames(t_s, l.len() as u32);
-        if let Some(p) = self.ring.as_mut() {
-            p.push_frames(l, r);
-        }
-    }
-}
-
-impl SystemSource for FakeSource {
-    fn negotiated_rate(&self) -> u32 {
-        self.rate
-    }
-    fn attach(&mut self, ring: Producer) -> Result<(), SourceError> {
-        self.ring = Some(ring);
-        Ok(())
-    }
-    fn arrival(&mut self) -> &mut ArrivalTracker {
-        &mut self.arrival
-    }
-    fn fill_snapshot(&mut self) -> ArrivalSnapshot {
-        self.arrival.stats().snapshot()
-    }
-    fn heartbeat(&self) -> &Heartbeat {
-        &self.hb
-    }
-}
-
-/// Fake [`OutputSink`]: keeps one `f32` buffer per channel (pre-filled with the
-/// sentinel) and drives its [`FakeCallback`] per period like an ASIO `buffer_switch`.
-struct FakeSink {
-    spec: StreamSpec,
-    buffers: Vec<Vec<f32>>,
-    cb: Option<FakeCallback>,
-    started: bool,
-}
-
-impl FakeSink {
-    fn new() -> Self {
-        FakeSink { spec: StreamSpec::default(), buffers: Vec::new(), cb: None, started: false }
-    }
-
-    /// One output period: splits the buffers into channel slices and calls the callback.
-    fn pump(&mut self, now_ticks: i64) {
-        let cb = self.cb.as_mut().expect("callback started");
-        let mut bufs: Vec<&mut [f32]> = self.buffers.iter_mut().map(|b| &mut b[..]).collect();
-        cb.render(&mut bufs, now_ticks);
-    }
-
-    fn reset_sentinel(&mut self) {
-        for b in &mut self.buffers {
-            for v in b.iter_mut() {
-                *v = sentinel();
-            }
-        }
-    }
-
-    fn channel(&self, ch: usize) -> &[f32] {
-        &self.buffers[ch]
-    }
-
-    fn pipeline(&self) -> &Pipeline {
-        self.cb.as_ref().expect("callback started").inner.pipeline()
-    }
-}
-
-/// The callback installed into [`FakeSink`]: wraps the portable `PipelineCallback`
-/// (`write = false` proves the sentinel catches unwritten output).
-struct FakeCallback {
-    inner: PipelineCallback,
-    write: bool,
-}
-
-impl OutputCallback for FakeCallback {
-    fn render(&mut self, out: &mut [&mut [f32]], now_ticks: i64) {
-        if self.write {
-            self.inner.render(out, now_ticks);
-        }
-    }
-}
-
-impl OutputSink for FakeSink {
-    type Callback = FakeCallback;
-
-    fn negotiate(&mut self, want: &StreamRequest) -> Result<StreamSpec, SinkError> {
-        self.spec = spec_of(want);
-        self.buffers = (0..want.channels as usize).map(|_| vec![sentinel(); want.buffer_frames as usize]).collect();
-        Ok(self.spec)
-    }
-
-    fn start(&mut self, cb: Self::Callback) -> Result<(), SinkError> {
-        self.cb = Some(cb);
-        self.started = true;
-        Ok(())
-    }
-
-    fn stop(&mut self) -> Result<(), SinkError> {
-        self.started = false;
-        self.cb = None;
-        Ok(())
-    }
-
-    fn spec(&self) -> &StreamSpec {
-        &self.spec
-    }
-}
 
 // ------------------------------------------------------------------------------------
 // Rig

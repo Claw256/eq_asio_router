@@ -50,6 +50,10 @@ static DEPRECATION_TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// Scans raw TOML for [`REMOVED_CONFIG_KEYS`] and stashes the found keys for
 /// [`take_deprecation_notice`]. Called by [`Config::load`] / [`Config::from_toml_str`].
+///
+/// Only *top-level* keys are considered: every removed key lived at the document
+/// root, and table-local keys (e.g. `[portable] source`, `[bridge] loopback_enabled`)
+/// would otherwise be false positives (Phase C).
 fn note_removed_keys(text: &str) {
     if DEPRECATION_TAKEN.load(Relaxed) {
         return;
@@ -58,6 +62,10 @@ fn note_removed_keys(text: &str) {
     for line in text.lines() {
         let l = line.trim();
         if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        if l.starts_with('[') {
+            // Inside a table: its keys are not document-root keys.
             continue;
         }
         let Some((k, _)) = l.split_once('=') else { continue };
@@ -153,6 +161,58 @@ impl BridgeConfig {
     }
 }
 
+/// `[portable]`: headless portable-engine settings (docs/cross-platform.md). A
+/// deliberate **new** section — the Windows-only `[bridge]` semantics
+/// ([`BridgeConfig`], VBMatrix shm ring) are NOT reused here (A4/Phase C scope):
+/// every OS selects its source/device by name. Missing table = defaults.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PortableConfig {
+    /// Source selector for this OS: `"auto"` (per-OS default), `"none"` (output only),
+    /// or a backend-specific source kind (`"pipewire"` monitor capture on Linux,
+    /// `"blackhole"` loopback tap on macOS). Unknown/unsupported selectors are
+    /// reported and treated as `"none"`.
+    pub source: String,
+    /// Output device: ASIO driver name (Windows; empty = `master_driver` /
+    /// "Yamaha Steinberg USB ASIO"), ALSA device (Linux; empty = "default"),
+    /// Core Audio device name (macOS; empty = system default output).
+    pub output_device: String,
+    /// Input/monitor/tap device name: PipeWire monitor source (Linux), BlackHole
+    /// loopback device (macOS). Empty = per-OS default.
+    pub input_device: String,
+    /// AutoEQ `ParametricEQ.txt` profile path; when set and readable it replaces
+    /// `profile` at startup (the path lands in `profile_source`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_path: Option<PathBuf>,
+}
+
+impl Default for PortableConfig {
+    fn default() -> Self {
+        PortableConfig {
+            source: "auto".to_string(),
+            output_device: String::new(),
+            input_device: String::new(),
+            profile_path: None,
+        }
+    }
+}
+
+impl PortableConfig {
+    /// Trimmed copy: selector/device strings trimmed, empty `source` becomes
+    /// `"auto"`, empty `profile_path` collapses to `None`.
+    pub fn sanitized(&self) -> Self {
+        PortableConfig {
+            source: {
+                let s = self.source.trim();
+                if s.is_empty() { "auto".to_string() } else { s.to_string() }
+            },
+            output_device: self.output_device.trim().to_string(),
+            input_device: self.input_device.trim().to_string(),
+            profile_path: self.profile_path.clone().filter(|p| !p.as_os_str().is_empty()),
+        }
+    }
+}
+
 /// Router configuration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -219,6 +279,9 @@ pub struct Config {
     /// VBMatrix bridge settings (see [`BridgeConfig`]).
     #[serde(default)]
     pub bridge: BridgeConfig,
+    /// Headless portable-engine settings (see [`PortableConfig`]; not the bridge).
+    #[serde(default)]
+    pub portable: PortableConfig,
 }
 
 /// What the rattle LFO modulates.
@@ -672,6 +735,7 @@ impl Default for Config {
             jbl_intensity: default_jbl_intensity(),
             jbl: JblParams::default(),
             bridge: BridgeConfig::default(),
+            portable: PortableConfig::default(),
         }
     }
 }
@@ -769,6 +833,7 @@ impl Config {
         c.jbl_intensity = c.jbl_intensity.min(100);
         c.jbl = c.jbl.sanitized();
         c.bridge = c.bridge.sanitized();
+        c.portable = c.portable.sanitized();
         c.jitter_margin_ms = if c.jitter_margin_ms.is_finite() { c.jitter_margin_ms.clamp(0.0, 40.0) } else { 0.0 };
         // Jitter margin: one global value stored under BRIDGE_SOURCE_KEY. Legacy per-device
         // keys (old files) collapse into it; the legacy scalar mirrors it when set.
@@ -1288,6 +1353,40 @@ duck_depth = 4.0
         assert_eq!(c.sanitized().bridge.ring_target_ms, 0.0);
         c.bridge.ring_target_ms = 500.0;
         assert_eq!(c.sanitized().bridge.ring_target_ms, 200.0);
+    }
+
+    #[test]
+    fn portable_section_defaults_round_trip_and_sanitizes() {
+        // Defaults: per-OS auto selection, no devices, no profile override.
+        let d = PortableConfig::default();
+        assert_eq!(d.source, "auto");
+        assert!(d.profile_path.is_none());
+        // A file without a [portable] table loads the defaults (old configs keep working).
+        let c = Config::from_toml_str("master_driver = \"X\"\n").unwrap();
+        assert_eq!(c.portable, d);
+        // A present table parses (its `source` key must not trip the removed-key scan).
+        let text = "[portable]\nsource = \"pipewire\"\noutput_device = \"hw:UR22C\"\ninput_device = \"UR22C Monitor\"\nprofile_path = \"eq/parametric.txt\"\n";
+        let c = Config::from_toml_str(text).unwrap();
+        assert_eq!(c.portable.source, "pipewire");
+        assert_eq!(c.portable.output_device, "hw:UR22C");
+        assert_eq!(c.portable.input_device, "UR22C Monitor");
+        assert_eq!(c.portable.profile_path, Some(PathBuf::from("eq/parametric.txt")));
+        // Round trip through the pretty serializer.
+        let mut c = Config::default();
+        c.portable.source = "blackhole".into();
+        c.portable.profile_path = Some(PathBuf::from("eq/parametric.txt"));
+        let out = toml::to_string_pretty(&c).unwrap();
+        assert!(out.contains("[portable]"), "{out}");
+        assert_eq!(Config::from_toml_str(&out).unwrap().portable, c.portable);
+        // sanitized(): trimmed selectors, empty source -> "auto", empty path -> None.
+        let mut c = Config::default();
+        c.portable.source = "  ".into();
+        c.portable.output_device = " default ".into();
+        c.portable.profile_path = Some(PathBuf::new());
+        let s = c.sanitized().portable;
+        assert_eq!(s.source, "auto");
+        assert_eq!(s.output_device, "default");
+        assert!(s.profile_path.is_none());
     }
 
     #[test]

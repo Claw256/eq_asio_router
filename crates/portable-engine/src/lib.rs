@@ -7,6 +7,7 @@
 //! * [`session`]: supervision (port of `router-engine/src/logic.rs` + the
 //!   `engine.rs` control-loop essentials).
 //! * [`status`]: [`seams::StatusTransport`] implementations (Null + in-process).
+//! * [`testing`]: hardware-free seam fakes + the `--selftest` harness (Phase C).
 //! * [`backend`]: per-OS dispatch (cfg only).
 //!
 //! Thin-crate decision (A2): DSP comes from `eq-core`, the ring / resampler /
@@ -17,6 +18,7 @@ pub mod pipeline;
 pub mod seams;
 pub mod session;
 pub mod status;
+pub mod testing;
 
 #[cfg(test)]
 mod pipeline_tests;

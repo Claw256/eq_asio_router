@@ -275,3 +275,104 @@ choice was not recorded in A1–A7. Resolved here:
   crates) — gate-forced by A7; API-level PipeWire-vs-Pulse choice is OPEN for B1
   under that constraint.
 - **OPEN** (Phase B): per-OS arrival-pattern measurement; cpal fallback call; ALSA period policy defaults.
+
+## Phase C results
+
+*(synthesis at `4f955ad` + Phase C working tree; produced by 02_execute.)*
+
+### What was wired
+
+- **Windows `OutputSink` over `asio-host`** (`backend/windows.rs`, feature
+  `backend-windows`): `WindowsSink::open[_with]` = `find_driver` +
+  `AsioDriver::load_diagnosed(&info, HWND::default())` — busy/holder diagnosis is
+  delegated to `asio-host` (`load_diagnosed` + `busy.rs`) and mapped into
+  `SinkError::Unavailable` (`map_open_error`). `negotiate` follows
+  `router-engine/src/engine.rs` policy: requested rate 0 = keep current (unsupported
+  rate logs + keeps, never fails), buffer = `session::choose_buffer_size(min, max,
+  preferred)` (driver-preferred clamped), `validate_output_channels` for the output
+  pair, `asio_convert::is_supported` on both sample types. `start` = `create_buffers`
+  + silence both halves + `drv.start()` with an `asio_host::Handler` whose
+  `buffer_switch` drives the frozen `OutputCallback` (f32 scratch -> native via
+  `router_core::asio_convert::write_f32_to_asio` per `channel_info` sample type) and
+  calls `output_ready`; `reset_request`/`sample_rate_changed`/`overload` map to
+  `Live::request_reset`/`xruns` through `WindowsCallback::with_live`. `stop` =
+  `drv.stop()` + `dispose_buffers`. Unit tests use the injectable loader
+  (`LoaderFn`, engine.rs `start_with` pattern) + pure mapping helpers — no hardware
+  claims. Documented in-file: `asio-host` hosts one driver per process; STA thread.
+- **`portable-cli` full headless flow** (`src/bin/portable-cli.rs`): config load
+  (`Config::load_or_default` + `[portable]`), AutoEQ profile override
+  (`eq_core::parse_parametric_eq` — DSP unwritten), eq-core parity knobs
+  (`bypass`/`eq_enabled`/`limiter`/`safety_buffer_ms`/`safety_buffer_auto`/
+  `resampler_quality`) wired through `EqProcessor`/`plan_target`, per-OS dispatch
+  (`WindowsSink` / `AlsaSink`+`PipeWireSource` / `MacSink`+`MacTap`) behind the
+  frozen seams, `Session` supervision loop until Ctrl+C (hand-written FFI:
+  `SetConsoleCtrlHandler` on Windows, `signal(SIGINT/SIGTERM)` on Unix — A8, no
+  `ctrlc` crate), status line per second with ring fill / rate / drift ppm / xruns
+  and the `latency: unmeasured (pending hardware validation)` label.
+- **`--selftest`** (`testing.rs::run_selftest`): the seam fakes were promoted from
+  `pipeline_tests.rs` into `src/testing.rs` (pub, std-only) so tests and the CLI
+  share one rig (deviation D4). Selftest drives tone -> ring -> matcher -> EQ (+6 dB
+  peaking) -> fake sink through a `Session`, 320 periods; passes iff
+  callbacks==320 && underruns==0 && overruns==0 && fault==0 && restarts==0 &&
+  measured gain within 0.5 dB. Platform-independent — runs in CI on all three OSes.
+- **`[portable]` config** (`eq-core/src/config.rs` `PortableConfig`): `source`
+  (per-OS selector), `output_device`, `input_device`, `profile_path`. Additive,
+  serde-default, distinct from `[bridge]` (A4: bridge semantics not reused).
+- **CI matrix** (`.github/workflows/ci.yml`, new `portable` job beside the
+  byte-identical `build-test`; `release.yml` untouched):
+  `strategy.matrix.os = [windows-latest, ubuntu-latest, macos-latest]`,
+  `fail-fast: false`; Windows legs run `cargo build --workspace --all-targets`,
+  `cargo test --workspace`, `portable-cli --selftest`; Linux/macOS legs run
+  `cargo check -p portable-engine`, `cargo build -p portable-engine --bin
+  portable-cli`, `cargo test -p portable-engine`, `portable-cli --selftest` (plus
+  `apt-get install libasound2-dev libpulse-dev` on ubuntu — `cargo run` links the
+  hand-written FFI).
+- **Docs**: `docs/cross-platform.md` (user-facing per-OS guide + hardware validation
+  checklist + licensing notes) created.
+
+### Deviations
+
+- **D1 (CI shape)**: `cargo build/test --workspace` runs on windows-latest only.
+  A1 evidence: `wasapi-capture`, `eq-asio-driver`, `router-engine`, `eq-asio-app`,
+  `router-cli` are unconditionally Win32; a workspace link on Linux/macOS is
+  impossible without out-of-scope cfg-gating of those crates. The portable-engine
+  scoped legs cover the ubuntu/macos half of the requirement.
+- **D2 (feature defaults)**: `portable-engine` `default = ["backend-linux",
+  "backend-macos", "backend-windows"]` (still cfg-per-OS in `backend/mod.rs`) so the
+  fixed, flag-free gates actually compile each backend. Verified: the cross-target
+  checks now compile B1/B2 + the per-OS CLI dispatch and stay clean.
+- **D3**: `[portable]` lives in eq-core as additive `PortableConfig`;
+  `[bridge]` untouched. Accompanying fix: `note_removed_keys` now only flags
+  *document-root* keys (all removed keys were top-level), so `[portable] source`
+  cannot false-positive the M3a deprecation notice.
+- **D4**: seam fakes promoted to `src/testing.rs` for `--selftest` reuse.
+- **D5**: Ctrl+C is hand-written `#[link]` FFI (A8 rule); the status line prints
+  once per second (supervision tick stays `--tick-ms`).
+- **D6**: the Windows portable *source* is not wired (out of the stated scope, which
+  defines only the Windows `OutputSink`); the CLI runs output-only there and says so.
+
+### OPEN items — closed
+
+- A5 redistribution wording **recorded** (`docs/cross-platform.md` §Licensing):
+  BlackHole is GPLv3 and **user-installed — we link, bundle and ship no BlackHole
+  code** (MIT distribution stays clean); ScreenCaptureKit fallback is future work;
+  the in-house Audio Server Plug-in (A5 rank 2) is the release-path option. No
+  library-consulted license text is reproduced.
+- A4 cpal rejection rationale **recorded** (same doc): host-substituted buffer sizes
+  break the ring ground truth, no producer-side arrival timestamps for
+  `ArrivalTracker`, and `*-sys` `build.rs` probes break the A7 cross-check gate.
+
+### OPEN items — left
+
+- **Hardware validation** (all OSes): the checklist in `docs/cross-platform.md` —
+  10-minute xrun-free run, round-trip latency measurement, EQ-on-air verification,
+  arrival-pattern/drift re-measurement (A7: not verifiable from this machine).
+  Latency readouts stay `unmeasured (pending hardware validation)` until then.
+- **Windows portable source**: system capture feeding the ring on Windows (WASAPI
+  loopback / bridge) — today the portable Windows run is output-path only; the full
+  source path remains the Windows app. Recommended next step if the portable CLI
+  must reach feature parity there.
+- **Stream rebuild on driver reset**: the headless supervisor classifies + backs off
+  (`ControlAction::Restart`) and re-arms, but does not yet tear down and rebuild the
+  hardware stream (router-engine does this in its STA loop).
+- **ASP timing** (A5 rank 2) and per-OS arrival measurement remain future work.

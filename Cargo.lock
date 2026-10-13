@@ -2335,9 +2335,11 @@ dependencies = [
 name = "portable-engine"
 version = "0.2.0"
 dependencies = [
+ "asio-host",
  "eq-core",
  "router-core",
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]
