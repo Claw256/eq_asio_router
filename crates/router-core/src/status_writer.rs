@@ -7,19 +7,27 @@
 //! If the mapping cannot be created the writer is simply absent (`Option`) and the engine
 //! runs without publishing.
 
+#[cfg(windows)]
 use core::mem::offset_of;
+#[cfg(windows)]
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
+#[cfg(windows)]
 use eq_core::{StatusBlock, STATUS_MAGIC, STATUS_MAPPING_NAME, STATUS_VERSION};
+#[cfg(windows)]
 use windows::core::PCWSTR;
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 
+#[cfg(windows)]
 const SIZE: usize = core::mem::size_of::<StatusBlock>();
 
+#[cfg(windows)]
 fn wide(name: &str) -> Vec<u16> {
     name.encode_utf16().chain(Some(0)).collect()
 }
@@ -77,6 +85,7 @@ pub struct BridgeReport {
 }
 
 /// Writer side.
+#[cfg(windows)]
 pub struct StatusWriter {
     base: *mut StatusBlock,
     /// Present when we own a Win32 mapping + view.
@@ -84,9 +93,12 @@ pub struct StatusWriter {
 }
 
 // SAFETY: the block is only touched through atomics.
+#[cfg(windows)]
 unsafe impl Send for StatusWriter {}
+#[cfg(windows)]
 unsafe impl Sync for StatusWriter {}
 
+#[cfg(windows)]
 impl StatusWriter {
     /// Creates (or opens) the standard named mapping. `None` if Win32 refuses.
     pub fn create_mapped() -> Option<Self> {
@@ -227,6 +239,7 @@ impl StatusWriter {
     }
 }
 
+#[cfg(windows)]
 impl Drop for StatusWriter {
     fn drop(&mut self) {
         self.set_running(false);
@@ -241,15 +254,19 @@ impl Drop for StatusWriter {
 }
 
 /// Read-only side for the GUI.
+#[cfg(windows)]
 pub struct StatusReader {
     base: *const StatusBlock,
     mapping: Option<HANDLE>,
 }
 
 // SAFETY: reads go through atomic loads of plain data.
+#[cfg(windows)]
 unsafe impl Send for StatusReader {}
+#[cfg(windows)]
 unsafe impl Sync for StatusReader {}
 
+#[cfg(windows)]
 impl StatusReader {
     /// Opens the standard mapping read-only; `None` if the engine is not running.
     pub fn open() -> Option<Self> {
@@ -293,6 +310,7 @@ impl StatusReader {
     }
 }
 
+#[cfg(windows)]
 impl Drop for StatusReader {
     fn drop(&mut self) {
         if let Some(h) = self.mapping.take() {
