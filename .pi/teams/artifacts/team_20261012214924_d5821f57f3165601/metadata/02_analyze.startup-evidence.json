@@ -1,0 +1,12 @@
+{
+  "lastLifecycleState": "finished",
+  "command": "pi",
+  "promptSentAt": "2026-10-12T22:02:35.026Z",
+  "promptAccepted": true,
+  "trustPromptDetected": false,
+  "transportHealthy": true,
+  "childProcessAlive": false,
+  "elapsedMs": 424119,
+  "stderrPreview": "Warning: No project session found with id 'crew-team202610122149'; creating a new session with that id.\n",
+  "classification": "unknown"
+}

@@ -27,4 +27,21 @@ desktop.ini
 .claude/settings.local.json
 
 # Pi session/agent local state (skills/workflows, if ever added, get re-included)
-/.pi/
+/.pi/*
+!/.pi/teams/
+/.pi/teams/*
+!/.pi/teams/artifacts/
+!/.pi/teams/graphs/
+/.pi/teams/state/
+/.pi/teams/cache/
+/.pi/teams/worktrees/
+/.pi/teams/imports/
+/.pi/teams/audit/
+
+# pi-crew runtime state
+/.crew/
+/.crew
+!.crew/artifacts/
+!.crew/graphs/
+!.crew/artifacts/.gitkeep
+!.crew/graphs/.gitkeep

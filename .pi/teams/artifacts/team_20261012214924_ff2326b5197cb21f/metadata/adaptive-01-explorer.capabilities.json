@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "taskId": "adaptive-01-explorer",
+  "role": "explorer",
+  "agent": "explorer",
+  "runtime": "child-process",
+  "permissionMode": "read_only",
+  "tools": [
+    "ask",
+    "bash",
+    "find",
+    "glob",
+    "grep",
+    "ls",
+    "read"
+  ],
+  "extensions": [
+    "C:\\Users\\Rexami\\.pi\\agent\\npm\\node_modules\\@arcanemachine\\pi-read\\src\\index.ts",
+    "C:\\Users\\Rexami\\.pi\\agent\\npm\\node_modules\\@gotgenes\\pi-anthropic-auth\\src\\index.ts",
+    "C:\\Users\\Rexami\\.pi\\agent\\npm\\node_modules\\@juicesharp\\rpiv-ask-user-question\\index.ts",
+    "C:\\Users\\Rexami\\.pi\\agent\\npm\\node_modules\\context-mode\\build\\adapters\\pi\\extension.js",
+    "C:\\Users\\Rexami\\.pi\\agent\\npm\\node_modules\\pi-mcp-adapter\\index.ts",
+    "C:\\Users\\Rexami\\.pi\\agent\\npm\\node_modules\\pi-model-switch\\index.ts"
+  ],
+  "skills": {
+    "names": [
+      "context-artifact-hygiene",
+      "read-only-explorer"
+    ],
+    "paths": [
+      "C:\\Users\\Rexami\\.pi\\agent\\npm\\node_modules\\pi-crew\\skills\\context-artifact-hygiene",
+      "C:\\Users\\Rexami\\.pi\\agent\\npm\\node_modules\\pi-crew\\skills\\read-only-explorer"
+    ],
+    "disabled": false
+  },
+  "model": {
+    "fallbacks": []
+  },
+  "inheritance": {
+    "projectContext": true,
+    "skills": false,
+    "systemPromptMode": "replace"
+  }
+}

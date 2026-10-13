@@ -1,0 +1,164 @@
+MODEL ATTEMPT 1: xiaomi-token-plan-ams/mimo-v2.6-flash
+success=true
+exitCode=0
+
+
+finalExitCode=0
+jsonEvents=130
+usage={"input":548,"output":8793,"cacheRead":33792,"cacheWrite":0}
+
+STDOUT:
+tool: read
+tool: read
+tool: read
+tool: read
+tool: read
+I have the full explorer handoff. Before composing the write-up, let me spot-verify the load-bearing claims (analyst grounding — not re-executing the audit):
+tool: grep
+tool: grep
+tool: grep
+tool: grep
+tool: find
+tool: read
+tool: grep
+All three load-bearing claims verified. Spot-checking the seam-type anchors before composing:
+tool: grep
+tool: grep
+Anchors verified. One last grounding check (license claim), then I'll compose:
+tool: read
+All anchors verified and the plan's structure confirmed (file ends with the Risks table at line 79+; appending `## Phase A results` is clean). 
+
+**Tooling note:** as analyst I have read/grep/find only — no write tool. My task contract names exactly one writable file, so I'll delegate the mechanical append to an executor with the exact composed content (zero-overlap rule honored: that file only).
+tool: delegate
+The delegate channel is unavailable (`no-manifest` — "do the work yourself"), but my toolset has no write/edit capability. This is a contract-field blocker (the task names one writable file I can't write), so per escalation policy I'll park one precise question:
+tool: ask
+Both coordination channels (`delegate`, `ask`) are down with `no-manifest` — "proceed with best judgment." One last attempt at the mailbox notification, then I'll deliver the composed section in my result:
+tool: message
+All coordination channels are down (`delegate`/`ask` → no-manifest, `message` → broker unavailable). Per the mailbox contract I'll include everything in this final result: the U10 handoff, the complete composed section as a verbatim-append appendix, and the analysis brief.
+
+---
+
+## Handoff
+
+### Goal
+Phase A of the cross-platform plan: produce (from a read-only audit) all seven deliverables — Win32 dependency map, architecture verdict, seam traits, output-backend decision, macOS source ranking, Phase B collision-free layout, cross-target validation recipe — as a `## Phase A results` section appended to `docs/plans/cross-platform.md`.
+
+### Constraints & Preferences
+- Only writable file: `docs/plans/cross-platform.md`; zero edits anywhere else (another crew owns other docs/GUI strings — zero overlap).
+- Read-only audit; no branches, no commits; every claim `file:line`-grounded; external facts (cpal status, BlackHole license) flagged OPEN, never asserted.
+- Decision markers: `DECIDED: … / OPEN for Phase B`; Windows workspace gate must remain green.
+
+### Progress
+**Done:**
+- All 7 deliverables researched and composed; independent verification of the load-bearing claims (see Critical Context).
+- Full `## Phase A results` markdown composed, ready for verbatim append (Appendix below).
+
+**In Progress:** none.
+
+**Blocked:**
+- **The file append itself** — I have no write/edit tool (read-only toolset), and all three coordination paths failed: `delegate` → `no-manifest`, `ask` → `no-manifest`, `message` → `broker unavailable`. **Owner: leader/writer** — append the Appendix verbatim to `docs/plans/cross-platform.md` (ends with the `## Risks` table; append after it, one blank line). **`docs/plans/cross-platform.md` was NOT modified by me.**
+
+### Key Decisions
+1. **Win32 map (A.1)** — classification table per crate; `eq-core`/`asio-abi` pure; `router-core` = only `status_writer.rs` is Win32; `router-engine` mixed (priority/engine/pipeline-adapter entangled); app/driver/asio/wasapi/bridge-mapping = stay Windows. **Verified hard blocker:** zero `cfg(windows)`/`cfg(unix)`/`target_os` in `crates/**/*.rs` while `windows-0.62.2/src/lib.rs` is `#![cfg(windows)]` (empty stub off-Windows) → whole-workspace cross-check impossible until gating lands.
+2. **DECIDED: thin new `portable-engine` crate** (plan's lean confirmed): router-engine's STA pump/ASIO session/MMCSS are exactly the non-porting parts; "port behind traits" requires the cfg-gating that *is* most of the port.
+3. **DECIDED: seams** as sketched (`OutputSink`/`SystemSource`/`Clock`/`StatusTransport`/`ControlLoop`) mapping `Handler` (`asio-host/src/lib.rs:141`), `FrameSource` (`resample.rs:19`), `ArrivalStats` (`arrival.rs:111`), `Handoff` (`processor.rs:121`), `StatusWriter` (`status_writer.rs:80`), `Live` (`pipeline.rs:48`).
+4. **DECIDED (conditional): cpal v1** both OSes (`BufferSize::Fixed` + event callbacks; plan `:38`), raw ALSA/CoreAudio fallback triggered by `Live` period-instability stats (plan risk `:84`). OPEN: cpal maintenance + Fixed honoring (external).
+5. **DECIDED: macOS source = BlackHole as installed dependency v1** (no linking ⇒ mere aggregation under our MIT `LICENSE:1`), ScreenCaptureKit = runtime fallback, in-house ASP deferred to Phase C. OPEN: exact BlackHole license (external), GPL/MIT posture (user).
+6. **DECIDED: Phase B layout** — `portable-engine/src/backend/{windows,linux,macos,mock}.rs` behind features; **single-owner B0 pre-wave mandatory** (scaffold + pre-seeded per-OS Cargo.toml sections + `status_writer.rs` gating + `logic.rs` relocation decision) before B1/B2 run parallel.
+7. **DECIDED: validation recipe** — `rustup target add x86_64-unknown-linux-gnu aarch64-apple-darwin`, scoped `cargo check -p … --target …` (not `--workspace`), Windows `cargo test` gate unchanged; empirical probe `-p router-core --target …` expected to fail at `status_writer.rs`.
+
+### Next Steps
+1. **Leader/writer (immediate):** append the Appendix to `docs/plans/cross-platform.md`, then confirm readback.
+2. Leader: schedule the **B0 pre-wave** (single owner) before launching B1/B2 — the collision-critical shared files are `Cargo.toml`s, `router-core/src/status_writer.rs`, `lib.rs`, `seams.rs`.
+3. Librarian: verify cpal maintenance/`BufferSize::Fixed` on alsa+coreaudio, BlackHole license/version, ScreenCaptureKit API levels.
+4. Executor: add the two rustup targets and run the A.7 probe to convert the cross-check blocker from inferred to empirically proven.
+
+### Critical Context
+- **Changed files: none** (write blocked, reported above). Read: `docs/plans/cross-platform.md` (full), `01_explore` artifacts (full), `LICENSE`, `windows-0.62.2/src/lib.rs`, grep sweeps over `crates/`.
+- **Verification evidence (re-run by me, independent of 01_explore):** `cfg(windows)|cfg(unix)|target_os` in `crates/**/*.rs` → **0 hits**; `use windows::` sweep → confined to the 9 crates with `windows = { workspace = true }` in their Cargo.toml (`eq-core`, `asio-abi` absent); `#![cfg(windows)]` confirmed at windows-crate root; seam anchors `FrameSource`/`ArrivalStats`/`Handoff`/`choose_buffer_size`/`StatusWriter`/`Handler` all confirmed at cited lines; plan section headers at `:16/:26/:46/:72/:79` (validates cited line refs). Anchors inherited from 01_explore without personal re-check: `engine.rs`/`pipeline.rs` internals (`:638`, `:1141-1218`, `:48-80`, `:607`).
+- **Risks:** HIGH — unappended deliverable + unscheduled B0 → B1/B2 collision or cross-check failure; HIGH — someone runs whole-workspace `--target` cross-check and misreads the windows-stub failure; MED — cpal `BufferSize::Fixed` behavior unverified (latency regressions); MED — BlackHole GPL posture unconfirmed; LOW — `logic.rs` duplication drift if relocation deferred.
+- **Runtime:** coordination tools unavailable this session (`no-manifest` / broker down) — result below is the sole delivery channel.
+
+### Provenance
+session=<not exposed — no bash env in analyst worker> model=<not exposed> reasoning=<not exposed> (sibling explorer reported `session=crew-team2026101221492 model=xiaomi-token-plan-ams/mimo-v2.6-flash reasoning=medium`; run `team_20261012214924_d5821f57f3165601`)
+
+---
+
+## APPENDIX — append verbatim to `docs/plans/cross-platform.md` (writer step)
+
+````markdown
+## Phase A results
+
+Audit basis: committed state `0728f2c`, gates green. Read-only audit — no source file was modified; this section is the only edit. Every claim carries a `file:line` anchor. Facts not verifiable from this repo (external library status/licensing) are marked **OPEN (external verify)** instead of asserted.
+
+Verification re-run for this write-up (independent of the explorer sweep): `cfg(windows)|cfg(unix)|target_os` → **0 hits** across `crates/**/*.rs`; `use windows::` sweep → hits confined to the crates listed below (`eq-core` and `asio-abi` have no `windows` dependency, per `crates/*/Cargo.toml`); `windows-0.62.2/src/lib.rs` crate root carries `#![cfg(windows)]`; seam-type anchors re-confirmed at the cited lines.
+
+### A.1 Win32 dependency map (deliverable 1)
+
+Classification: **(a)** DSP/portable — pure logic, ports as-is. **(b)** platform service — needs a per-OS equivalent behind a seam. **(c)** Windows-specific — stays Windows-only.
+
+| Crate | Win32 / `windows`-crate usage (file:line) | Class |
+|---|---|---|
+| `eq-core` | none — deps are serde/toml/thiserror only (`crates/eq-core/Cargo.toml`); `src/status.rs:1-2` is layout-only ("mapping … done by the driver/GUI via Win32") | (a) |
+| `router-core` | `status_writer.rs:14-17` (`HANDLE`, `CreateFileMappingW`/`MapViewOfFile`), `status_writer.rs:101` `CreateFileMappingW`; feature decl `Cargo.toml:10-13` — **only** Win32 module; `resample.rs` / `arrival.rs` / `ring.rs` / `processor.rs` / `logger.rs` / `watchdog.rs` / `watcher.rs` / `analyze.rs` / `band.rs` / `click.rs` / `wav.rs` / `asio_convert.rs` = 0 Win32 (`asio_convert.rs` is pure `unsafe` over `asio-abi` PODs) | `status_writer`=(b), rest=(a) |
+| `router-engine` | `priority.rs:28-31` + whole file (MMCSS `AvSetMmThreadCharacteristics`, `timeBeginPeriod`) — 360 lines ≈100% Win32; `engine.rs:31-35` imports (incl. HWND), `Wake`/`InstanceGuard`/`pump_wait` `engine.rs:153-224` (message pump required by ASIO STA, doc `engine.rs:1-2`), control-panel HWND `engine.rs:89`; `pipeline.rs:143-160` QPC clock, `pipeline.rs:414`/`:443` MMCSS, ASIO `Handler` impl `pipeline.rs:583-669`; `synth.rs:68` `timeBeginPeriod` | mixed: (b) clock/priority/service, (c) STA pump + ASIO session, (a) render core |
+| `eq-asio-app` | `tray.rs:325-332`, `autostart.rs:14-17`, `install.rs:4-6`, `single_instance.rs:7-9`, `sys.rs:5-10`, `main.rs:38`; features `Cargo.toml:18-29` | (c) GUI/shell (eframe port = stretch goal per plan) |
+| `router-cli` | `main.rs:25-26` `SetConsoleCtrlHandler`; depends on `wasapi-capture` (`Cargo.toml:18`) for `devices`/`latency` subcommands; Win32 audio calls in `latency.rs` | console ctrl=(b) tiny; WASAPI latency tooling=(c) |
+| `wasapi-capture` | whole crate: features `Cargo.toml:18-35`; MMCSS `session.rs:14`/`:22`, `loopback.rs:22-32`, `impulse.rs:25-33`; COM `device.rs:5-14`; KS `ks.rs:8-16`; also `process_loopback.rs`, `policy.rs`, `tone.rs` | (c) measurement/capture tooling — the engine never opens WASAPI |
+| `bridge-abi` | `mapping.rs:6-14` (`CreateFileMappingW`, QPC `:14`), doc `mapping.rs:1-2` "only module that touches the OS"; `layout.rs` pure | mapping=(c) for v1 (plan: bridge not needed on these OSes), layout=(a) |
+| `asio-host` / `asio-probe` | `asio-host/src/lib.rs:13-18` COM `CoInitializeEx` STA + registry, `busy.rs:12-18`; `asio-probe/src/main.rs:13` | (c) |
+| `asio-abi` | no `windows` dep (POD ABI definitions only) | (a) code / (c) usage |
+| `eq-asio-driver` | `com.rs:8-11` registry/module path, `pacing.rs:26-29` QPC + waitable timer + MMCSS; features `Cargo.toml:14-24` | (c) stays Windows |
+
+**Hard blocker found (verified):** the workspace has **zero** `cfg(windows)`/`cfg(unix)`/`target_os` gates, while every affected crate declares `windows = { workspace = true }` (`router-core/Cargo.toml:10`, `router-engine:14`, `router-cli:18`, `bridge-abi:10`, `eq-asio-app:18`, `eq-asio-driver:14`, `asio-host:10`, `asio-probe:11`, `wasapi-capture:*** The `windows` crate is `#![cfg(windows)]` (`…/windows-0.62.2/src/lib.rs` crate root) — an **empty stub** on unix/mac targets — so every `use windows::…` site (~40 in router-engine/router-core/router-cli alone) fails to resolve off-Windows. Consequence: `cargo check --workspace --target …` cannot pass until gating lands (see A.7).
+
+### A.2 Architecture decision (deliverable 2)
+
+**DECIDED: write a new thin `portable-engine` crate** reusing `eq-core` + `router-core` primitives; do not port `router-engine` behind traits. The plan's lean (Phase A section above) is confirmed against the code:
+
+- `router-engine` is ~6.7k lines; the Windows-entangled core is exactly the parts that don't port:
+  - `priority.rs` — 360 lines, ~100% MMCSS/timer (b).
+  - `engine.rs` control thread = STA message pump: `pump_wait` runs every iteration of the session loop (`engine.rs:1141-1218`), single-instance mutex `engine.rs:182-208`, `Session` bound to `AsioDriver` (`engine.rs:540-605`, ASIO teardown in `Drop`), ~365 lines of ASIO bring-up in `Session::open` (`engine.rs:606-970`: rate negotiation `:626-635`, `choose_buffer_size` call `:638`, sample-type/channel setup `:644-652`, bridge shm attach `:665-690`).
+  - `pipeline.rs` render core (`Pipeline`, `:342-578`) **is** portable except QPC clock `:143-160`, MMCSS `:414`, and the ASIO output adapter (`OutputSet`/`PtrTable` `:174-238`, `Handler` impl `:583-669`, ≈90 lines) — the adapter is the natural `OutputSink` seam origin.
+- Reusable as-is: `logic.rs` (521 lines, 0 Win32: `choose_buffer_size` `:202`, back-off, burst estimate, capacity planning), `status.rs` (302, 0 Win32), `tap.rs` (189), `baseline.rs` (817), `bridge.rs` state machine (687, 0 Win32 imports — its *source role* is Windows-only), `pipeline_tests.rs`.
+- Structural argument: because **no `cfg(windows)` exists anywhere** (A.1), "port behind traits" would first require gating ~40 `use windows::…` sites across router-engine/router-core/router-cli — that gating *is* most of the port — and the gated-out remainder (STA pump, single-instance, ASIO session, MMCSS) is the Win
+...[pi-crew compacted 9562 chars, head+tail preserved]...
+ | Validation recipe (A.7) | **DECIDED** — OPEN: empirical cross-target probe pending `rustup target add` |
+````
+
+---
+
+```
+ANALYSIS_BRIEF: Phase A audit complete — all seven deliverables composed and code-verified (Win32 map, thin portable-engine verdict, seam traits, cpal-v1 conditional, BlackHole-v1 macOS source, collision-free Phase B layout, validation recipe); the only unfulfilled contract field is the physical append to docs/plans/cross-platform.md, blocked by a read-only toolset and a down coordination bus (delegate/ask/message all failed).
+REQUIREMENTS:
+  - Deliverables 1–7 each present with file:line evidence and DECIDED/OPEN markers (satisfied — Appendix)
+  - Appendix appended verbatim to docs/plans/cross-platform.md as "## Phase A results"; zero edits to any other file (NOT satisfied — no write channel; writer step required)
+  - Windows workspace gate remains green; no branches/commits (satisfied — zero mutations by this worker)
+  - External-library facts flagged OPEN rather than asserted (satisfied — cpal, BlackHole, ScreenCaptureKit)
+CONSTRAINTS:
+  - Single writable file: docs/plans/cross-platform.md; zero overlap with concurrent doc/GUI crew
+  - Read-only audit; current checkout only; no commits unless requested
+  - Every claim must be file:line grounded; cross-target checks must be scoped `-p` (windows crate compiles empty off-Windows)
+  - B1/B2 parallel wave requires disjoint files: B0 pre-wave owns all shared files
+ASSUMPTIONS:
+  - [load-bearing] The Append target file ends at the Risks table and nobody else edits it (task grants exclusive ownership of this file)
+  - [load-bearing] 01_explore's unverified engine.rs/pipeline.rs interior line numbers are accurate (my independent re-grep confirmed the pattern and all seam anchors; ~15 interior anchors inherited)
+  - "Analyst may write the one designated doc" — the task packet grants it, overriding the generic no-write stance; blocked only by missing capability, not by role boundary
+AMBIGUITIES:
+  - How to physically land the Appendix given no write tool and dead delegate/ask/message — MUST-RESOLVE (leader: append or re-spawn with write)
+  - cpal maintenance + BufferSize::Fixed honoring on alsa/coreaudio — DEFER-TO-USER/librarian (external facts)
+  - BlackHole exact license/version + GPL-vs-MIT aggregation posture — DEFER-TO-USER before publishing install docs
+  - logic.rs relocation vs duplication — DEFER-TO-USER (B0 owner decides; safe to default to copy-then-dedup if leader silent)
+  - B0 pre-wave scheduling before B1/B2 — MUST-RESOLVE (leader scheduling, not design)
+RISKS:
+  - HIGH: Appendix not yet in the plan doc; if B1/B2 launch without B0, shared-file collisions and cross-check failures are near-certain
+  - HIGH: whole-workspace `cargo check --target` will fail confusingly (empty windows stub, zero cfg gates) unless A.7 scoping is followed
+  - MED: cpal BufferSize::Fixed may not be honored on a backend → period instability → latency regression; fallback path documented
+  - MED: BlackHole license/install-UX unverified; publishing instructions prematurely creates compliance exposure
+  - LOW: deferred logic.rs relocation risks divergence between router-engine and portable-engine copies
+HANDOFF_TO_PLANNER: The analysis is finished and frozen in the Appendix — planner needs no further research. Phase B planning should treat it as input: (1) writer step appends the Appendix verbatim to docs/plans/cross-platform.md and confirms readback; (2) schedule a single-owner B0 pre-wave (scaffold portable-engine/portable-cli, pre-seed per-OS Cargo.toml target sections, cfg-gate router-core/src/status_writer.rs, decide logic.rs relocation, add rustup targets and run the A.7 probe) as a hard predecessor to the B1/B2 parallel wave; (3) assign B1 = backend/linux.rs only, B2 = backend/macos.rs only, with the shared-file edit ban from A.6; (4) queue the three OPEN external verifications (cpal, BlackHole, ScreenCaptureKit) to a librarian lane before cpal is committed as the v1 backend; (5) carry the seven-row decision summary forward as the Phase B acceptance checklist.
+```
+
+
+STDERR:
+Warning: No project session found with id 'crew-team202610122149'; creating a new session with that id.

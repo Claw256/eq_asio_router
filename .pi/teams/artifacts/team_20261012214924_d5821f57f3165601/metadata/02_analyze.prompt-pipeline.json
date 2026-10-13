@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "taskId": "02_analyze",
+  "stages": [
+    {
+      "name": "task-packet-built",
+      "references": [
+        "metadata/02_analyze.task-packet.json"
+      ]
+    },
+    {
+      "name": "dependency-context-collected",
+      "references": [
+        "metadata/02_analyze.inputs.json"
+      ]
+    },
+    {
+      "name": "skills-rendered-or-disabled",
+      "references": [
+        "metadata/02_analyze.skills.md"
+      ],
+      "details": {
+        "disabled": false,
+        "skillInstructionCount": 2
+      }
+    },
+    {
+      "name": "capability-inventory-recorded",
+      "references": [
+        "metadata/02_analyze.capabilities.json"
+      ]
+    },
+    {
+      "name": "coordination-bridge-attached",
+      "references": [
+        "metadata/02_analyze.coordination-bridge.md"
+      ]
+    },
+    {
+      "name": "prompt-rendered",
+      "references": []
+    },
+    {
+      "name": "prompt-artifact-written",
+      "references": [
+        "prompts/02_analyze.md"
+      ]
+    }
+  ]
+}
