@@ -2332,6 +2332,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-engine"
+version = "0.2.0"
+dependencies = [
+ "eq-core",
+ "router-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "presser"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

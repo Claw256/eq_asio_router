@@ -8,6 +8,7 @@ members = [
     "crates/eq-core",
     "crates/eq-asio-driver",
     "crates/eq-asio-app",
+    "crates/portable-engine",
     "crates/router-core",
     "crates/wasapi-capture",
     "crates/router-engine",

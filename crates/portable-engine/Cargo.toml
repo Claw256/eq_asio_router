@@ -1,0 +1,29 @@
+[package]
+name = "portable-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eq-core.workspace = true
+router-core = { path = "../router-core" }
+thiserror.workspace = true
+
+# Target-specific backend dependencies (A8/A4: hand-written #[link] FFI only —
+# no -sys/wrapper crates, their build.rs probes pkg-config/system SDKs and would
+# break the A7 cross-target `cargo check` gate from a non-target host).
+# Left EMPTY in Phase A; B1/B2 fill these sections in Phase B if needed.
+[target.'cfg(target_os = "linux")'.dependencies]
+# B1 fills (Phase B) — expected to stay empty for raw ALSA/PipeWire FFI.
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# B2 fills (Phase B) — expected to stay empty for raw Core Audio FFI.
+
+[features]
+default = []
+# CI slicing (A6): each backend module compiles only when its feature is on AND the
+# target OS matches (see src/backend/mod.rs). Off by default so the workspace builds
+# everywhere before Phase B/C land their backend files.
+backend-linux = []
+backend-macos = []
+backend-windows = []
