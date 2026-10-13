@@ -34,7 +34,7 @@
 //! tested with a synthetic header and a fake clock) or a background thread.
 
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -72,7 +72,9 @@ pub const LEARN_MIN_TICKS: u32 = 200;
 /// The mapping is created by the driver (first comer); the app only *opens* it, so
 /// "mapping attached" also tells the readiness panel that VBMatrix has initialized
 /// the EQ ASIO Router slot at least once. The header (and therefore ring indices and
-/// counters) survives driver restarts while this handle is alive.
+/// counters) survives driver restarts while this handle is alive — which is why the
+/// app keeps one attached in the process-wide [`BridgeHolder`] (see there) instead of
+/// attaching per engine session.
 pub struct BridgeAttach {
     mapping: Mapping,
 }
@@ -80,7 +82,13 @@ pub struct BridgeAttach {
 impl BridgeAttach {
     /// Opens the fixed-name mapping and validates its header.
     pub fn attach() -> Result<BridgeAttach, EngineError> {
-        let mapping = bridge_abi::open().ok_or_else(|| {
+        Self::attach_named(bridge_abi::MAPPING_NAME)
+    }
+
+    /// As [`attach`](Self::attach) with an explicit mapping name (tests).
+    /// Open-only: creation stays driver-side.
+    pub fn attach_named(name: &str) -> Result<BridgeAttach, EngineError> {
+        let mapping = Mapping::open_named(name).ok_or_else(|| {
             EngineError::Bridge("mapping not found (VBMatrix is not running the EQ ASIO Router driver)".into())
         })?;
         let h = unsafe { mapping.header() };
@@ -124,6 +132,65 @@ fn negotiated(rate: f64, buffer: u32) -> Result<(u32, u32), EngineError> {
 }
 
 // ---------------------------------------------------------------------------------
+// Process-lifetime holder
+// ---------------------------------------------------------------------------------
+
+/// Holds the app's [`BridgeAttach`] for the lifetime of the process.
+///
+/// The mapping object lives exactly as long as any process holds a handle: the
+/// driver (inside VBMatrix) opens/creates it at `init()` and releases it at
+/// teardown, and VBMatrix re-creates/releases the driver object every few
+/// seconds. Attaching per engine *session* therefore let the mapping die whenever
+/// the engine was stopped — the next host re-created it fresh (ring indices and
+/// counters reset) and session starts failed with "bridge mapping not found" until
+/// it reappeared. The holder attaches **once** (open-only; creation stays
+/// driver-side) and keeps the `Mapping` across engine sessions and engine stops;
+/// sessions borrow [`Arc<BridgeAttach>`] handles from it. When the app starts
+/// before any driver ever ran, [`ensure`](Self::ensure) fails and the engine's
+/// back-off loop re-tries until the mapping appears.
+pub struct BridgeHolder {
+    attach: Mutex<Option<Arc<BridgeAttach>>>,
+}
+
+impl BridgeHolder {
+    /// An empty holder.
+    pub const fn new() -> Self {
+        BridgeHolder { attach: Mutex::new(None) }
+    }
+
+    /// Attaches the fixed-name mapping unless it is already held, and returns the handle.
+    pub fn ensure(&self) -> Result<Arc<BridgeAttach>, EngineError> {
+        self.ensure_named(bridge_abi::MAPPING_NAME)
+    }
+
+    /// As [`ensure`](Self::ensure) with an explicit mapping name (tests).
+    pub fn ensure_named(&self, name: &str) -> Result<Arc<BridgeAttach>, EngineError> {
+        let mut g = self.attach.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(a) = g.as_ref() {
+            return Ok(a.clone());
+        }
+        let a = Arc::new(BridgeAttach::attach_named(name)?);
+        *g = Some(a.clone());
+        Ok(a)
+    }
+
+    /// True while a mapping is held (its ring state survives for the process lifetime).
+    pub fn is_attached(&self) -> bool {
+        self.attach.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+}
+
+impl Default for BridgeHolder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The app-wide mapping holder (one per process): attached at engine-manager
+/// construction and kept until the process exits.
+pub static BRIDGE: BridgeHolder = BridgeHolder::new();
+
+// ---------------------------------------------------------------------------------
 // Ring A consumer (audio callback side)
 // ---------------------------------------------------------------------------------
 
@@ -131,14 +198,15 @@ fn negotiated(rate: f64, buffer: u32) -> Result<(u32, u32), EngineError> {
 /// the existing `RateMatcher` (gate -> drift controller -> resampler) runs unchanged.
 ///
 /// Wait-free: atomics only (see `bridge-abi`). `Send` because the header lives in
-/// mapped memory owned by the session, not by the thread that created this value.
+/// mapped memory owned by the process-lifetime [`BridgeHolder`], not by the thread
+/// that created this value.
 #[derive(Clone, Copy)]
 pub struct BridgeSource {
     hdr: *const Header,
 }
 
-// SAFETY: the pointed-to header outlives the pipeline (the session disposes the ASIO
-// callback before dropping its `Mapping`); access is atomic and single-consumer.
+// SAFETY: the pointed-to header outlives the pipeline (the [`BridgeHolder`] keeps the
+// mapping alive for the whole process); access is atomic and single-consumer.
 unsafe impl Send for BridgeSource {}
 
 impl FrameSource for BridgeSource {
@@ -554,6 +622,65 @@ mod tests {
         assert_eq!(negotiated(44_100.0, 128).unwrap(), (44_100, 128));
         assert!(negotiated(f64::NAN, 256).is_err());
         assert!(negotiated(48_000.0, 4).is_err());
+    }
+
+    /// Unique mapping name for the holder test (never the fixed contract name).
+    fn unique_map_name() -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        format!(
+            "Local\\eq_asio_router_bridge_v2_hold_test_{}_{}",
+            std::process::id(),
+            t + u128::from(SEQ.fetch_add(1, Ordering::Relaxed))
+        )
+    }
+
+    /// A [`BridgeHolder`] keeps the mapping (and its ring contents) alive across
+    /// simulated "session stop/start": sessions only *borrow* it, so the ring state
+    /// survives even the driver releasing its own handle (VBMatrix driver churn).
+    #[test]
+    fn held_mapping_survives_session_stop_start() {
+        let name = unique_map_name();
+        // The driver (VBMatrix side) creates the mapping and fills ring A.
+        let driver = Mapping::open_or_create_named(&name).expect("driver create");
+        assert!(driver.created());
+        let n = 1024usize;
+        let l: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let r: Vec<f32> = (0..n).map(|i| -(i as f32)).collect();
+        assert_eq!(unsafe { driver.header().ring_a_push(&l, &r) }, n);
+        assert_eq!(unsafe { driver.header().fill_a() }, n as u64);
+
+        // The app attaches once and holds the mapping for the process lifetime.
+        let holder = BridgeHolder::new();
+        assert!(!holder.is_attached());
+        let attach = holder.ensure_named(&name).expect("attach");
+        assert!(holder.is_attached());
+
+        // Session 1: borrows a source, consumes 300 frames, stops.
+        {
+            let mut src = attach.source();
+            let (mut ol, mut or) = (vec![0.0f32; 300], vec![0.0f32; 300]);
+            assert_eq!(src.pop(&mut ol, &mut or), 300);
+            assert_eq!(ol[123], 123.0);
+        }
+
+        // VBMatrix releases the driver object: the holder keeps the image alive.
+        drop(driver);
+        assert!(Mapping::open_named(&name).is_some(), "the held mapping must keep the object alive");
+
+        // Session 2 (after "session stop/start"): borrows again, contents intact.
+        let attach2 = holder.ensure_named(&name).expect("still attached");
+        assert!(Arc::ptr_eq(&attach, &attach2), "the holder must not re-attach");
+        {
+            let mut src = attach2.source();
+            assert_eq!(FrameSource::fill(&src), n - 300, "no frames may be lost across the session restart");
+            let (mut ol, mut or) = (vec![0.0f32; n - 300], vec![0.0f32; n - 300]);
+            assert_eq!(src.pop(&mut ol, &mut or), n - 300);
+            assert_eq!(ol[0], 300.0, "ring must continue exactly where session 1 stopped");
+            assert_eq!(or[7], -307.0);
+        }
+        assert_eq!(attach2.header().a_overruns(), 0);
+        assert_eq!(attach2.header().a_discarded(), 0, "counter state survives too");
     }
 
     #[test]

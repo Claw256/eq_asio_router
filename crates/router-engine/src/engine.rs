@@ -522,8 +522,9 @@ enum SourceSide {
     /// In-process ring fed from the synthetic source thread (measurements): packet-arrival model.
     Capture(Arc<ArrivalStats>),
     /// Shared-memory ring A from the VBMatrix-driven driver: ring-fill statistics plus
-    /// the driver's heartbeat (see `bridge`).
-    Bridge { attach: BridgeAttach, window: FillWindow, monitor: BridgeMonitor },
+    /// the driver's heartbeat (see `bridge`). The `Mapping` itself is process-lifetime
+    /// ([`bridge::BRIDGE`]); sessions only borrow this handle.
+    Bridge { attach: Arc<BridgeAttach>, window: FillWindow, monitor: BridgeMonitor },
 }
 
 /// Bridge values sampled once per control tick (EngineStatus + status block).
@@ -585,7 +586,7 @@ impl Drop for Session {
             drop(d); // Release the Yamaha before the capture side goes away.
         }
         if let Some(mut lb) = self.loopback.take() {
-            lb.stop(); // taps the callback's ring; must end before the mapping drops
+            lb.stop(); // taps the callback's ring; must end before the callback is disposed
         }
         if let Some(mut y) = self.synth.take() {
             y.stop();
@@ -658,14 +659,16 @@ impl Session {
         *lock(&sh.caps) = Some(caps.clone());
 
         // Source side: the VBMatrix bridge (the default source) or an in-process synthetic
-        // signal for hardware measurements. The mapping is created by the driver; a missing
-        // mapping or an unpublished format retries through the same back-off machinery as a
-        // missing master (`retry_unavailable` decides whether the first failure is fatal).
+        // signal for hardware measurements. The mapping is created by the driver and held
+        // process-wide (`bridge::BRIDGE`): sessions borrow it, so the ring state survives
+        // engine stops and driver churn. A missing mapping or an unpublished format retries
+        // through the same back-off machinery as a missing master (`retry_unavailable`
+        // decides whether the first failure is fatal).
         let synthetic = sh.opts.synthetic.clone();
         let (bridge_attach, bridge_fmt, ep_name, hint_rate) = match &synthetic {
             Some(sy) => (None, None, "synthetic source".to_string(), sy.rate),
             None => {
-                let b = BridgeAttach::attach()?;
+                let b = bridge::BRIDGE.ensure()?;
                 let fmt = b.negotiated()?;
                 (Some(b), Some(fmt), bridge::BRIDGE_SOURCE_NAME.to_string(), fmt.0)
             }
@@ -974,6 +977,12 @@ enum RunEnd {
 fn control_thread(sh: Arc<Shared>, rx: Receiver<Cmd>, tx: Sender<Cmd>, ready: mpsc::SyncSender<Result<(), EngineError>>) {
     asio_host::init_com_sta();
     let _mmcss = ControlMmcss::register();
+    // Hold the driver's shm mapping for the lifetime of the process (see
+    // `bridge::BridgeHolder`): best-effort once at engine-manager construction, re-tried
+    // with the normal back-off from `Session::open` while the driver has not run yet.
+    if sh.opts.synthetic.is_none() {
+        let _ = bridge::BRIDGE.ensure();
+    }
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| control_loop(&sh, &rx, &tx, &ready)));
     if r.is_err() {
         rlog!(Level::Error, "control thread panicked");

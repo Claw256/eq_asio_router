@@ -53,6 +53,8 @@ pub struct App {
     pub panel_path: Option<PathBuf>,
     pub panel_error: Option<String>,
     pub bridge_running: bool,
+    /// Display-side view of the lifetime bridge counter totals/deltas/rates (panel `bridge`).
+    pub bridge_view: panels::bridge::CounterView,
     /// Holder the user is being asked to confirm a close request for.
     pub confirm_close: Option<router_engine::HolderInfo>,
     pub close_msg: Option<String>,
@@ -157,6 +159,7 @@ impl App {
             panel_path: None,
             panel_error: None,
             bridge_running: sys::bridge_running(),
+            bridge_view: panels::bridge::CounterView::new(),
             confirm_close: None,
             close_msg: None,
             last_file_poll: now,
@@ -451,6 +454,9 @@ impl App {
             self.last_bridge_poll = now;
             self.bridge_running = sys::bridge_running();
         }
+        // Bridge counter totals/deltas/rates for the readiness panel: sampled once per
+        // status tick so they keep updating while the panel is hidden.
+        self.bridge_view.sample(panels::bridge::counter_snapshot());
         if self.debounce.poll(now) {
             self.save_now();
         }

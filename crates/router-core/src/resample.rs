@@ -304,10 +304,16 @@ impl DriftController {
         self.delta
     }
 
-    /// Restart the fill estimate at the target and re-enter acquisition mode (keeps the
-    /// learned clock offset). Called when the stream (re)starts at exactly the target fill.
-    pub fn restart_filter(&mut self) {
-        self.est = self.target;
+    /// Restart the fill estimate at the actual fill and re-enter acquisition mode (keeps the
+    /// learned clock offset). Called when the stream (re)starts; `fill` must be the fill the
+    /// stream restarts at (the startup gate re-opens at `target + open_bias`, *not* at the
+    /// target): restarting the estimate at the bare target would feed the whole bias to the
+    /// offset learner as if it were drift and wedge the controller for minutes.
+    pub fn restart_filter(&mut self, fill: usize) {
+        self.est = fill as f64;
+        self.age = 0.0;
+        self.init_sum = 0.0;
+        self.init_n = 0;
     }
 
     /// The fill changed by a known amount (frames discarded): follow it instead of treating it as noise.
@@ -319,10 +325,7 @@ impl DriftController {
     pub fn reset(&mut self) {
         self.delta = 0.0;
         self.trim = 0.0;
-        self.age = 0.0;
-        self.init_sum = 0.0;
-        self.init_n = 0;
-        self.restart_filter();
+        self.restart_filter(self.target as usize);
     }
 
     /// Feed a fill measurement taken `dt` seconds after the previous one; returns the
@@ -594,7 +597,6 @@ impl RateMatcher {
             // Just opened: start from a clean state and fade in.
             self.resampler.reset();
             self.xf_pos = self.xf_len;
-            self.drift.restart_filter();
             self.fade = GainRamp::new(0.0);
             self.fade.set_target(1.0, self.cfg.fade_frames);
             self.faded_out = false;
@@ -607,6 +609,9 @@ impl RateMatcher {
                 self.discarded_total += d as u64;
                 fill = src.fill();
             }
+            // Re-acquire from the fill the stream actually restarts at (`open_at`), not the
+            // bare target (see `DriftController::restart_filter`).
+            self.drift.restart_filter(fill);
         }
         if fill > self.cfg.target_fill.saturating_mul(2) {
             let excess = fill - self.cfg.target_fill;
@@ -1314,5 +1319,63 @@ mod tests {
         assert!(st.discarded > 0, "fill {before} should have been trimmed");
         assert!(st.fill <= 1000 + 1);
         assert_eq!(rm.discarded_frames(), st.discarded as u64);
+    }
+
+    /// Bridge mode: the startup gate is biased (`set_open_bias`) — it opens and trims
+    /// at `target + open_bias` — and driver churn re-arms it mid-stream. With a synthetic
+    /// +-600 ppm producer/consumer skew the fill must settle back *at* the target and
+    /// trims must stop. Regression for the fill-estimate restart at the bare target: the
+    /// stream restarts at `target + open_bias`, so restarting the estimate at `target`
+    /// fed the whole bias to the offset learner as if it were drift — `delta`/trim
+    /// wandered (or saturated at `MAX_TRIM`), the fill stayed pinned ~`open_bias` above
+    /// the target and every re-open chopped the ring again ("ring trimmed ..." every
+    /// few seconds).
+    #[test]
+    fn drift_converges_after_gate_rearms_with_clock_skew() {
+        for &ppm in &[-600.0, 600.0] {
+            let target = 4096usize;
+            let bias = 2884usize;
+            let (mut p, mut c) = ring::channel(ring_capacity_for(target));
+            let mut rm = RateMatcher::new(RateMatcherConfig::new(48000, 48000, target, ResamplerQuality::Cubic));
+            rm.set_open_bias(bias);
+            let block = 256usize;
+            let cap_rate = 48000.0 * (1.0 + ppm * 1e-6);
+            let (mut l, mut r) = (vec![0.0f32; block], vec![0.0f32; block]);
+            let ones = vec![0.25f32; block];
+            let dt = block as f64 / 48000.0;
+            let cap_dt = block as f64 / cap_rate;
+            let (mut t_cap, mut t_asio) = (0.0f64, 0.037);
+            let mut discards_after = 0u64; // trims after the churn phase (t > 120 s)
+            let (mut min_late, mut max_late) = (usize::MAX, 0usize);
+            while t_asio < 285.0 {
+                while t_cap <= t_asio {
+                    p.push_frames(&ones, &ones);
+                    t_cap += cap_dt;
+                }
+                // Simulated driver churn: the gate re-arms and re-opens at `target + bias`.
+                for t0 in [30.0f64, 60.0, 90.0] {
+                    if (t_asio - t0).abs() < dt {
+                        rm.rearm();
+                    }
+                }
+                let st = rm.render(&mut c, &mut l, &mut r);
+                if t_asio > 120.0 {
+                    discards_after += st.discarded as u64;
+                }
+                if t_asio > 225.0 {
+                    min_late = min_late.min(st.fill);
+                    max_late = max_late.max(st.fill);
+                }
+                t_asio += dt;
+            }
+            println!(
+                "ppm {ppm:+}: late fill {min_late}..{max_late} (target {target}), trim {:+.1} ppm, trims after 120 s: {discards_after}",
+                rm.trim() * 1e6
+            );
+            assert_eq!(discards_after, 0, "ppm {ppm}: trims must stop once both clocks are steady");
+            assert!(min_late as i64 >= target as i64 - 512, "ppm {ppm}: fill dipped to {min_late}");
+            assert!(max_late as i64 <= target as i64 + 512, "ppm {ppm}: fill climbed to {max_late}");
+            assert!((rm.trim() * 1e6 - ppm).abs() < 100.0, "ppm {ppm}: trim did not converge: {} ppm", rm.trim() * 1e6);
+        }
     }
 }

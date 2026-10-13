@@ -27,6 +27,7 @@ desktop.ini
 .claude/settings.local.json
 
 
+
 # Pi / pi-crew session and agent state (never committed)
 /.pi/
 /.crew/
