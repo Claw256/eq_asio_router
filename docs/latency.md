@@ -1,10 +1,21 @@
 # Latency
 
-Back to the [documentation index](README.md). Labels: **measured** (on the author's machine, in the cited report), **estimate** (inferred or modelled). The end-to-end measurement `router-cli latency` ([section 5a](#5a-end-to-end-measurement-router-cli-latency)) has been run live on the Yamaha (2026-10-10): it showed that the render side is much larger than the 10 ms the panel used to assume, and it can now store its result (`%APPDATA%\eq_asio_router\latency_measured.toml`) so that the GUI, the tray tooltip and the `router-cli run` status line show the **measured** render side for the active source and label it as such. Without a fresh measurement they show an **estimate** (20 ms for VAC Line 1, 100 ms for the Hi-Fi Cable) and say so. What drives the render side, and what applications can do about it, is in [section 5b](#5b-what-determines-the-render-side-vac-line-1-render-matrix). The VAC Line 1 path has run on the hardware in the live measurements below (no corruption or fallback seen), but the full [first-run checklist](#7-first-run-validation-checklist-vac-line-1) (soak, listening) has not been completed, so treat the VAC figures as measured but short-run.
+Back to the [documentation index](README.md). Labels: **measured** (on the author's machine, in the cited report), **estimate** (inferred or modelled). The source is the VBMatrix bridge (`vbmatrix`) since the M3a cutover; the end-to-end measurement `router-cli latency` ([section 5a](#5a-end-to-end-measurement-router-cli-latency)) stores its result (`%APPDATA%\eq_asio_router\latency_measured.toml`, keyed by the fixed source `vbmatrix`) so that the GUI, the tray tooltip and the `router-cli run` status line show the **measured** render side and label it as such; without a fresh measurement they show an **estimate** (20 ms, a typical shared-mode client into `VBMatrix In`) and say so. What drives the render side, and what applications can do about it, is in [section 5b](#5b-what-determines-the-render-side-vac-line-1-render-matrix). **The end-to-end latency of the bridge chain has not been recorded yet** (the M4 hardware checklist is open); every figure below predates the bridge. Sections 3, 4, 5b, 6 and 7 describe the pre-bridge WASAPI sources (Hi-Fi Cable / VAC "Line 1") and are kept verbatim as history, each marked **Historical (pre-bridge)**.
 
 ## 1. Budget
 
-Measured on the author's machine with the Hi-Fi Cable source (Yamaha UR22C, `PeriodFrames` 256, Low Latency mode, 48 kHz): reported total **56.2 ms**.
+**Bridge-era budget (source = bridge, `vbmatrix`).** The four terms are unchanged in shape, but the source term is now the bridge delivery, not a WASAPI capture:
+
+| Term | Basis | What sets it |
+|---|---|---|
+| Yamaha output | measured (driver reports 375 samples at 48 kHz) | ASIO buffer plus USB buffering chosen by `LatencyMode` and `PeriodFrames` |
+| Ring (ring-A mean fill) | live status | block (negotiated bridge buffer) + safety (2 ms) + jitter headroom |
+| Source staleness | model until statistics exist | half the negotiated bridge buffer, `buffer / 2 / rate` (`router-engine/src/bridge.rs`) |
+| Render side | **estimate** (20 ms) until `router-cli latency` has been run for the `vbmatrix` source, then **measured** | app buffer, Windows engine period and queue until the app writes into `VBMatrix In` |
+
+The bridge chain's end-to-end figure is not yet recorded (M4 open). The measurement below is the pre-bridge budget and is kept as history:
+
+> **Historical (pre-bridge).** Measured on the author's machine with the Hi-Fi Cable source (Yamaha UR22C, `PeriodFrames` 256, Low Latency mode, 48 kHz): reported total **56.2 ms**.
 
 | Term | ms | Basis | What sets it |
 |---|---|---|---|
@@ -15,9 +26,9 @@ Measured on the author's machine with the Hi-Fi Cable source (Yamaha UR22C, `Per
 
 The four terms add up to 54.6 ms (with the old 10 ms render guess); the reports quote 56.2 ms for the total (the difference is not explained in the reports, probably readings taken at different moments). That 56.2 ms was a model total: the end-to-end measurement of the same Hi-Fi Cable path later gave 152 to 164 ms. The GUI and the `router-cli run` status line show the same breakdown live: `lat X ms (out + ring + cap + render N measured|est, not measured)`; the GUI latency panel also prints where the render side comes from and, when it is measured, the end-to-end figure at that time next to the live model total, and the tray tooltip appends `est.` to the total while the render side is only an estimate.
 
-**Which render side is used.** `Caps::latency_breakdown` takes a `RenderSide` (eq-core `measured` module): the newest entry of `latency_measured.toml` for the default render profile that matches the running session (same capture device, same keep-alive state, same ASIO buffer, capture period within 25 %) and is at most 30 days old; otherwise the estimate for the source (20 ms VAC, 100 ms Hi-Fi / VB cables). The file is read once when the engine starts a session.
+**Which render side is used.** `Caps::latency_breakdown` takes a `RenderSide` (eq-core `measured` module): the newest entry of `latency_measured.toml` for the default render profile that matches the running session (same source key `vbmatrix`, same ASIO buffer, source period within 25 %) and is at most 30 days old; otherwise the default estimate for the bridge source (20 ms: a typical shared-mode 10 ms client into `VBMatrix In`). The file is read once when the engine starts a session.
 
-Model for the capture staleness: `E[b^2] / (2 r E[b])` over arrival events (b = event size in frames, r = rate): regular 480-frame packets give 5.0 ms, regular 128-frame packets 1.3 ms.
+Model for the source staleness (bridge): half the negotiated buffer period, `buffer / (2 r)` (r = rate), until fill statistics exist. (The pre-bridge arrival-event model was `E[b^2] / (2 r E[b])` over arrival events: regular 480-frame packets give 5.0 ms, regular 128-frame packets 1.3 ms.)
 
 ## 2. How to reduce each term
 
@@ -29,20 +40,22 @@ Set `PeriodFrames` and `LatencyMode` in the Yamaha control panel ([setup-guide.m
 
 Ring target = safety buffer + one master buffer + jitter headroom. The headroom is the part that can shrink:
 
-- The new arrival model measures the real capture pattern (`router-core/src/arrival.rs`) and lowers the headroom slowly once at least 10 s of statistics exist. The old fixed rule (two packets) is what the 27.6 ms measurement still reflects.
-- "Learn (30 s)" (GUI button, or `router-cli run --learn --seconds 60`; `run` needs `--seconds N` or an explicit `--forever`, unknown flags are rejected with exit 2 before anything starts, `router-cli --help` prints the usage) measures the lowest safe headroom while audio is playing and stores it as `jitter_margin_ms`. It is a floor: the engine will not go below it.
+- The fill statistics measure the real dip of ring A (`router-engine/src/bridge.rs`, `router-core/src/arrival.rs`) and lower the headroom slowly once at least 10 s of statistics exist.
+- "Learn (30 s)" (GUI button, or `router-cli run --learn --seconds 60`; `run` needs `--seconds N` or an explicit `--forever`, unknown flags are rejected with exit 2 before anything starts, `router-cli --help` prints the usage) measures the lowest safe headroom while audio is playing and stores it as `jitter_margin_by_device["vbmatrix"]` (mirrored into `jitter_margin_ms`). It is a floor: the engine will not go below it.
 - `safety_buffer_ms` (default 2 ms) and `safety_buffer_auto` trade robustness for latency; the auto component rises after underruns.
-- A regular, small capture period reduces the dip the headroom has to cover (see the capture term).
+- A small negotiated bridge buffer reduces the dip the headroom has to cover (see the source term); `[bridge] ring_target_ms` can only raise the target, never lower it.
 
-### Capture staleness and the capture period
+### Source staleness and the bridge buffer
 
-Staleness is half an event on average, so it follows the period and the delivery pattern. The Hi-Fi Cable cannot be improved: its engine period is pinned at 10 ms and pairs are delivered back to back. The only way to a smaller or more regular period is another source (section 3): VAC Line 1 with a fixed 6 ms (288 frame) capture period (`capture_period_ms = 6.0`, preset "VAC Line 1" in the GUI or `router-cli run --source vac`).
+Staleness is half an event on average. On the bridge it is half the negotiated ASIO buffer of the slot (`buffer / 2 / rate`), so a smaller buffer negotiated with VBMatrix reduces it directly. (Historical: on the pre-bridge WASAPI sources staleness followed the capture period and delivery pattern — see sections 3 and 5b and [latency/](latency/), kept verbatim.)
 
 ### Render side
 
-Applications write into the cable with their own buffer and the Windows engine period; the cable driver then hands the data to its capture side. Measured on VAC Line 1 ([5b](#5b-what-determines-the-render-side-vac-line-1-render-matrix)): an ordinary 10 ms event-driven shared-mode client (what almost every player and game uses) sees about 24 to 25 ms from `ReleaseBuffer` to the capture packet, of which about 20 ms is inside Windows (engine period plus the engine's own buffering) and 3 ms is capture staleness; the render keep-alive does **not** shorten that (it lowers the endpoint's engine period to 1 ms, but a client that opens its stream the legacy way keeps its own 10 ms period). Only a client that opens the stream with `IAudioClient3` at the endpoint's minimum period gets down to about 6 to 7 ms. A test client that tops its 1056-frame buffer up completely adds about 11 ms of queue on top (36 ms). On the Hi-Fi Cable the cable driver adds about 70 to 80 ms inside itself and nothing on the render side helps (its endpoint minimum period is 10 ms). `router-cli latency` measures the total effect end to end (section 5a) and stores it for the panel.
+Applications write into a `VBMatrix In` endpoint with their own buffer and the Windows engine period; VBMatrix then hands the data to the bridge slot. The measured behaviour of a typical shared-mode client (pre-bridge measurements on the VAC/Hi-Fi path, [5b](#5b-what-determines-the-render-side-vac-line-1-render-matrix)): an ordinary 10 ms event-driven shared-mode client (what almost every player and game uses) sees about 20 ms from `ReleaseBuffer` to delivery, most of it inside Windows (engine period plus the engine's own buffering); only a client that opens the stream with `IAudioClient3` at the endpoint's minimum period gets down to about 6 to 7 ms. A test client that tops its 1056-frame buffer up completely adds about 11 ms of queue on top. `router-cli latency` measures the total effect end to end (section 5a) and stores it for the panel.
 
 ## 3. Investigation verdicts
+
+> **Historical (pre-bridge).** These findings predate the VBMatrix bridge (they compare WASAPI capture APIs on the Hi-Fi Cable / VAC sources) and are kept verbatim.
 
 Full reports: [latency/capture_apis.md](latency/capture_apis.md), [latency/apo_tap.md](latency/apo_tap.md), [latency/vac_lite.md](latency/vac_lite.md).
 
@@ -69,6 +82,8 @@ VAC Line 1 details:
 
 ## 4. Recommendations, in priority order
 
+> **Historical (pre-bridge).** These recommendations were written for the WASAPI sources (items mentioning VAC Line 1 or the Hi-Fi Cable no longer apply since the bridge cutover) and are kept verbatim.
+
 1. Use the new jitter model and run "Learn (30 s)" while normal audio plays. Largest controllable term (ring, 27.6 ms measured today); no hardware change, no risk beyond slightly less margin.
 2. Make sure the Yamaha is at the lowest period that is stable (256 now; try 128 and confirm with `router-cli caps` and a listening test). Estimate: about 2.7 ms.
 3. Switch the source to VAC Line 1 with a fixed 6 ms (288 frame) capture period (preset "VAC Line 1"; quick start in [setup-guide.md](setup-guide.md#vac-line-1-quick-start)), after the [first-run validation](#7-first-run-validation-checklist-vac-line-1) has passed on your machine. Measured: inj->capture drops from about 105 ms (Hi-Fi Cable) to about 25 ms for a typical 10 ms client and to about 7 ms for an IAudioClient3 client. Keep the Hi-Fi Cable preset as the fallback.
@@ -81,17 +96,16 @@ VAC Line 1 details:
 - Live: the status panel in the GUI, or the per-second line of `router-cli run` (`ring mean`, `headroom`, `arrival p99.9 gap / dip`, `lat ...`, `under / over / xrun`).
 - Capture cadence and integrity: `capture-probe run`, then `capture-probe exp OUT.wav ...` followed by `capture-probe check OUT.wav ...`: sample-accurate means 0 mismatches and 0 slips. Use quiet signals ([configuration.md](configuration.md#7-capture-probe)).
 - Output quality: `router-cli run --dump-dir DIR`, then `router-cli analyze` on the WAVs.
-- Source status (GUI Source section, or the first lines of `router-cli run`): capture mode in use, requested versus granted period, fallback, keep-alive engine period.
-- `router-cli latency`: end-to-end measurement with a click injected into the cable and timestamped on the Yamaha's Streaming L/R loopback inputs, section 5a. The result is stored in `latency_measured.toml` and replaces the render-side estimate in the panel (section 5a, "Storing the result").
+- Source status (GUI bridge panel, or the first lines of `router-cli run`): mapping attached, slot running, negotiated rate/buffer, ring fills, ring counters.
+- `router-cli latency`: end-to-end measurement with a click injected into a `VBMatrix In` endpoint and timestamped at the bridge source (stage 1, ring-A tap) and on the Yamaha's Streaming L/R loopback inputs (stage 2), section 5a. The result is stored in `latency_measured.toml` (source key `vbmatrix`) and replaces the render-side estimate in the panel (section 5a, "Storing the result").
 
 ## 5a. End-to-end measurement: `router-cli latency`
 
-Quit the tray app first (it holds the Yamaha and the engine mutex); `router-cli holders` must list nothing. Then, for the Hi-Fi Cable source and for the VAC source:
+Quit the tray app first (it holds the Yamaha and the engine mutex); `router-cli holders` must list nothing. Then:
 
 ```text
 router-cli latency --baseline                      # first: what do the detectors see with nothing injected?
-router-cli latency --source cable --no-match-cable --count 5 --interval-ms 1200 --db -35 --shape burst:18500:2
-router-cli latency --source vac --count 5 --interval-ms 1200 --db -35 --shape burst:18500:2
+router-cli latency --count 5 --interval-ms 1200 --db -35 --shape burst:18500:2
 ```
 
 The high-frequency burst (`--shape burst:18500:2`) is needed whenever the Yamaha loopback carries a microphone (see "Baseline and thresholds"); on a machine with a silent loopback the default `--db -40` and the default 1.5 kHz burst work as before.
@@ -102,11 +116,11 @@ Add `--json` for machine-readable output. `router-cli latency --selftest` needs 
 
 ### What is injected and what is timestamped
 
-1. **Injection.** A 2 ms raised-cosine burst of 1.5 kHz (or a short chirp, `--shape chirp`) at -40 dBFS peak (never above -35) is written into the cable's playback endpoint through a normal shared-mode, event-driven WASAPI stream at the endpoint's mix format, like an application would. The QPC is taken right before `ReleaseBuffer` of the buffer holding the click. The stream renders silence the rest of the time, so the cable's render clock runs throughout. An estimate of when the click leaves the render client is recorded too (`IAudioClock::GetPosition` plus its QPC, cross-checked with `GetCurrentPadding` plus `GetStreamLatency`).
-2. **Capture-side detection.** In the router's capture callback the first frame at or above a threshold (click level - 20 dB) gives the QPC at callback entry (all frames of a packet are delivered at that instant).
-3. **Loopback detection.** The engine, started with `EngineOptions::loopback_probe`, creates two extra ASIO input buffers on the Yamaha's loopback pair ("UR22C Streaming L/R", picked by name, else inputs 2 and 3) and, only while armed, scans input half `index` in every `bufferSwitch` for the first sample above a threshold derived from the measured baseline (see "Baseline and thresholds"; the former fixed offset click + forced preamp - 25 dB is now only the lower bound). The result is the QPC at callback entry plus the sample offset in the block, and the click's peak, which is used to correct the threshold crossing back to the click's first frame (a 2 ms click crosses a low threshold a few samples after its start). Without the option no extra buffers exist and the callback does no extra work; when not armed the callback does one relaxed load.
+1. **Injection.** A 2 ms raised-cosine burst of 1.5 kHz (or a short chirp, `--shape chirp`) at -40 dBFS peak (never above -35) is written into a `VBMatrix In` render endpoint through a normal shared-mode, event-driven WASAPI stream at the endpoint's mix format, like an application would. The QPC is taken right before `ReleaseBuffer` of the buffer holding the click. The stream renders silence the rest of the time, so the endpoint's render clock runs throughout. An estimate of when the click leaves the render client is recorded too (`IAudioClock::GetPosition` plus its QPC, cross-checked with `GetCurrentPadding` plus `GetStreamLatency`).
+2. **Source-side detection (stage 1, ring-A tap).** At the bridge source tap (the ring-A frames the engine consumes) the first frame at or above a threshold (click level - 20 dB) gives the QPC at callback entry; this is where the click reappears after VBMatrix has routed it through the bridge slot.
+3. **Loopback detection (stage 2).** The engine, started with `EngineOptions::loopback_probe`, creates two extra ASIO input buffers on the Yamaha's loopback pair ("UR22C Streaming L/R", picked by name, else inputs 2 and 3) and, only while armed, scans input half `index` in every `bufferSwitch` for the first sample above a threshold derived from the measured baseline (see "Baseline and thresholds"; the former fixed offset click + forced preamp - 25 dB is now only the lower bound). The result is the QPC at callback entry plus the sample offset in the block, and the click's peak, which is used to correct the threshold crossing back to the click's first frame (a 2 ms click crosses a low threshold a few samples after its start). Without the option no extra buffers exist and the callback does no extra work; when not armed the callback does one relaxed load.
 
-The router runs its normal pipeline (cable, WASAPI capture, ring, resampler, EQ, Yamaha ASIO output) with the preamp forced to -20 dB, the limiter on and no live config reload, so the click reaches the Yamaha at about -55 to -60 dBFS.
+The router runs its normal pipeline (bridge ring A, resampler, EQ, Yamaha ASIO output) with the preamp forced to -20 dB, the limiter on and no live config reload, so the click reaches the Yamaha at about -55 to -60 dBFS.
 
 ### Baseline and thresholds
 
@@ -136,14 +150,16 @@ The router runs its normal pipeline (cable, WASAPI capture, ring, resampler, EQ,
 
 ### Reading the breakdown
 
-The last lines compare the measurement with the latency panel's model `Yamaha out + ring + capture staleness + render side` (the render side is the source default, **20 ms for VAC Line 1 and 100 ms for the Hi-Fi Cable**, until a measured entry exists; the first model used 10 ms). The measured VAC value is **23.8 ms** (run saved 2026-10-10; see [Where the render side comes from](#where-the-render-side-comes-from-238-ms)):
+The last lines compare the measurement with the latency panel's model `Yamaha out + ring + source staleness + render side` (the render side is the source default, **20 ms for the `vbmatrix` bridge source**, until a measured entry exists; the first model used 10 ms). The figures below are pre-bridge VAC measurements; the measured VAC value is **23.8 ms** (run saved 2026-10-10; see [Where the render side comes from](#where-the-render-side-comes-from-238-ms)):
 
 - `measured to-DAC equivalent` is the median over the impulses, with its range.
-- `implied render side = measured - (Yamaha out + ring + capture)` is the number to compare with the panel's render side (20 ms VAC default, 23.8 ms measured). It also absorbs what the model leaves out (resampler and EQ delay, block quantisation), so a modest excess is expected.
+- `implied render side = measured - (Yamaha out + ring + source staleness)` is the number to compare with the panel's render side (20 ms bridge default; the pre-bridge VAC run measured 23.8 ms). It also absorbs what the model leaves out (resampler and EQ delay, block quantisation), so a modest excess is expected.
 - `injection -> capture delivery` against `render side + capture staleness`, and `capture -> loopback tap` against `ring + ASIO block`, show which stage is off. The direct render side is `inj->cap` minus the measured capture staleness.
 - On the Hi-Fi Cable the ring is a sawtooth (pairs of packets), so single totals scatter by up to about one pair; min and max show that. An impulse is flagged as an outlier if it is more than `max(2.5 ms, 3 sigma_MAD)` from the median. Use at least 5 impulses, repeat after restarting the engine, and compare medians.
 
 ### Where the render side comes from (23.8 ms)
+
+> **Historical (pre-bridge).** This saved run measured the VAC "Line 1" source and is kept verbatim.
 
 Saved run (`%APPDATA%\eq_asio_router\latency_measured.toml`, VAC Line 1, legacy 10 ms shared-mode client). **Measured** unless marked model.
 
@@ -165,11 +181,11 @@ Points to keep straight:
 
 ### Storing the result
 
-After a successful run with at least 3 detected clicks the command writes (read-modify-write, additive, atomic) `%APPDATA%\eq_asio_router\latency_measured.toml`: one `[[entries]]` per capture device, keep-alive state, capture period, ASIO buffer and render profile, holding the median `render_side_ms` (the implied render side: the to-DAC equivalent minus Yamaha out + ring + capture staleness, as printed), `render_queue_ms`, `inj_to_capture_ms`, `capture_to_tap_ms`, `total_ms` (corrected), `to_dac_ms`, the number of clicks, the date and the engine parameters (`asio_buffer`, `capture_period_frames`, `keepalive`, `safety_ms`, `target_frames`) and the render profile. `--no-save` never writes; an aborted run or fewer than 3 clicks never writes. A run with a non-default render stream is written only with `--save`, under its own render profile; the panel only uses the `default` profile (typical 10 ms client). The engine reads the file once per session; an entry is used when the device and keep-alive state match, the ASIO buffer is equal, the capture period is within 25 % and it is at most 30 days old. `router-cli latency` itself starts the engine without reading the file, so its model line shows the pure estimate. API: `eq_core::MeasuredLatency` (`load`, `save`, `upsert`, `lookup`, `render_side`), `RenderSide`, `RenderBasis`.
+After a successful run with at least 3 detected clicks the command writes (read-modify-write, additive, atomic) `%APPDATA%\eq_asio_router\latency_measured.toml`: one `[[entries]]` per source (the fixed key `vbmatrix`), ASIO buffer, source-period field and render profile, holding the median `render_side_ms` (the implied render side: the to-DAC equivalent minus Yamaha out + ring + source staleness, as printed), `render_queue_ms`, `inj_to_capture_ms`, `capture_to_tap_ms`, `total_ms` (corrected), `to_dac_ms`, the number of clicks, the date and the engine parameters (`asio_buffer`, `capture_period_frames`, `safety_ms`, `target_frames`) and the render profile. `--no-save` never writes; an aborted run or fewer than 3 clicks never writes. A run with a non-default render stream is written only with `--save`, under its own render profile; the panel only uses the `default` profile (typical 10 ms client). The engine reads the file once per session; an entry is used when the source key matches, the ASIO buffer is equal, the source period is within 25 % and it is at most 30 days old. `router-cli latency` itself starts the engine without reading the file, so its model line shows the pure estimate. API: `eq_core::MeasuredLatency` (`load`, `save`, `upsert`, `lookup`, `render_side`), `RenderSide`, `RenderBasis`.
 
 ### Safety limits
 
-Click at most -35 dBFS (default -40), refused above in the library and the CLI; router preamp forced to -20 dB, limiter on, so the Yamaha output is about -55 dBFS; at most 10 impulses per run, each waiting at most 4 s; the sink must be a virtual cable unless `--allow-sink` names it; the run aborts if the router output exceeds -40 dBFS (always, during the baseline and every click wait), if the capture sink is not silent (above -60 dBFS), or if the loopback carries programme audio (above -40 dBFS raw; -20 dBFS only for a >= 15 kHz burst with the high-pass) or its noise floor is too high to detect the click (see above); the Yamaha is released on every exit path; nothing in Windows is changed (`--no-match-cable` also keeps the cable rate).
+Click at most -35 dBFS (default -40), refused above in the library and the CLI; router preamp forced to -20 dB, limiter on, so the Yamaha output is about -55 dBFS; at most 10 impulses per run, each waiting at most 4 s; the sink must be an allowed injection endpoint (a known virtual cable or a `VBMatrix In` render endpoint) unless `--allow-sink` names it; the run aborts if the router output exceeds -40 dBFS (always, during the baseline and every click wait), if the sink is not silent (above -60 dBFS), or if the loopback carries programme audio (above -40 dBFS raw; -20 dBFS only for a >= 15 kHz burst with the high-pass) or its noise floor is too high to detect the click (see above); the Yamaha is released on every exit path; nothing in Windows is changed.
 
 ### No-router baseline
 
@@ -201,6 +217,8 @@ Safety rules enforced in code: the sink must be named with `--allow-sink` (the e
 - Not yet verified: a full-chain figure for an IAudioClient3 client (clicks of the 1 ms-period stream are lost between render and capture); real games and players (which stream type they open); the latency convention of the UR22C (driver input latency 280 and output 375 samples are trusted for the corrected / to-DAC figures); whether the Hi-Fi Cable delay is a fixed driver buffer or depends on the cable's configuration; why the clock-based render queue estimate is constant to 0.01 ms; the DAC and the USB output path after the loopback tap (only the to-DAC estimate covers them); the `--baseline` mixer-state readout is limited to the plain XML fields because the mixer parameters cannot be decoded.
 
 ## 5b. What determines the render side (VAC Line 1 render matrix)
+
+> **Historical (pre-bridge).** These measurements predate the VBMatrix bridge and are kept verbatim.
 
 Measured 2026-10-10 with `capture-probe impulses --target "Line 1" --device "Line 1" --cmode fixed --period-frames 288 [--keepalive] --count 10 --interval-ms 600 --db -35` and the render options of section 5a (no Yamaha involved, debug build, medians of 10 clicks, VAC Line 1 at 48 kHz, quiet clicks into the cable only). "render q" is the clock-based estimate (`IAudioClock`) of the time the click spends in the injecting WASAPI stream; "inj->cap" is injection to the capture packet that carries the click (the render side plus up to one 6 ms capture period). The engine period column is that of the render endpoint after the test stream started.
 
@@ -259,6 +277,8 @@ Expected totals on VAC Line 1 with the current router (Yamaha 256 frames): typic
 
 ## 6. When to back off
 
+> **Historical (pre-bridge).** The symptoms and fixes below refer to the removed WASAPI sources and are kept verbatim.
+
 Raise `safety_buffer_ms` or the Yamaha `PeriodFrames`, or go back to the Hi-Fi Cable and shared capture, if any of these appear:
 
 - `underruns`, `overruns`, `xruns` or `gate_rearms` increase; audible crackle; the fault state leaves Ok.
@@ -267,6 +287,8 @@ Raise `safety_buffer_ms` or the Yamaha `PeriodFrames`, or go back to the Hi-Fi C
 - Dropouts only under USB or CPU load: the Yamaha period or mode is too aggressive.
 
 ## 7. First-run validation checklist (VAC Line 1)
+
+> **Historical (pre-bridge).** This checklist validates the removed VAC "Line 1" source and is kept verbatim; the bridge's hardware checklist (M4) is in [plans/vbmatrix-bridge.md](plans/vbmatrix-bridge.md).
 
 Status: the VAC path has been measured on hardware (capture-side runs and full-chain `router-cli latency` runs, sections 5a and 5b: about 50 to 52 ms to the DAC with a legacy client, render side 23.8 ms). Still unrun: a long soak with listening, a live fallback to Shared, and persistence of the Line 1 capture endpoint across a reboot. The planner target (about 600 frames at 288-frame packets, start target 784) is a model. Work through this once, in order, and stop at the first failure (go back to the Hi-Fi Cable preset, keep the log `%TEMP%\eq_asio_router_engine.log`).
 

@@ -149,9 +149,9 @@ pub fn icon_kind(snap: &Snapshot) -> IconKind {
     }
 }
 
-/// "EQ ASIO Router — Running (48000 Hz, 30.2 ms)". `running` = (sample rate, total latency ms).
+/// "Headroom — Running (48000 Hz, 30.2 ms)". `running` = (sample rate, total latency ms).
 pub fn tooltip(label: &str, running: Option<(u32, f64, bool)>) -> String {
-    let base = format!("EQ ASIO Router \u{2014} {label}");
+    let base = format!("Headroom \u{2014} {label}");
     let t = match running {
         // an estimated render side makes the total a model: say so ("est."), a measured one is plain
         Some((rate, ms, measured)) if rate > 0 => format!("{base} ({rate} Hz, {ms:.1} ms{})", if measured { "" } else { " est." }),
@@ -558,7 +558,7 @@ mod win {
             let hwnd = match CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 class,
-                w!("EQ ASIO Router tray"),
+                w!("Headroom tray"),
                 WS_OVERLAPPED,
                 0,
                 0,
@@ -635,9 +635,9 @@ mod tests {
     #[test]
     fn tooltip_text() {
         let s = tray_state(&snap(EngineState::Running), "Running", false, false);
-        assert_eq!(s.tooltip, "EQ ASIO Router \u{2014} Running (48000 Hz, 30.2 ms est.)");
+        assert_eq!(s.tooltip, "Headroom \u{2014} Running (48000 Hz, 30.2 ms est.)");
         let s = tray_state(&Snapshot::default(), "Stopped", false, false);
-        assert_eq!(s.tooltip, "EQ ASIO Router \u{2014} Stopped");
+        assert_eq!(s.tooltip, "Headroom \u{2014} Stopped");
         let long = tooltip(&"x".repeat(300), None);
         assert_eq!(long.encode_utf16().count(), 127);
     }

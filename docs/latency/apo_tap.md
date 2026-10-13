@@ -1,5 +1,7 @@
 # APO tap feasibility (audio-engine tap instead of cable capture)
 
+> **Historical (pre-bridge).** These measurements predate the VBMatrix bridge and are kept verbatim.
+
 > Purpose: feasibility of tapping the Windows audio engine with an APO instead of capturing a cable.
 > Date: 2026-10-10 (this report: research only, nothing installed). Method: read-only registry and file inspection, string scan of a copy of the Equalizer APO DLL, model of the router latency.
 > Back to the [documentation index](../README.md).

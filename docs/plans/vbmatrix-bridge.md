@@ -144,23 +144,25 @@ Behavior:
 
 ## Component 4 — removals (hard cutover)
 
-- `router-engine`: `cable.rs` (cable-format helper), `source.rs` WASAPI readiness,
+- [x] `router-engine`: `cable.rs` (cable-format helper), `source.rs` WASAPI readiness,
   keep-alive wiring, fixed-period capture mode, `--source` CLI switch, capture-device
   selection, `jitter_margin_by_device` (keep a single global margin), VAC presets.
-- `eq-asio-app`: capture-device picker, VAC Line 1 preset UI, cable rate-match toggle.
-- Config: remove `capture_device`, `source`, `capture_mode`, `keepalive`,
+- [x] `eq-asio-app`: capture-device picker, VAC Line 1 preset UI, cable rate-match toggle.
+- [x] Config: remove `capture_device`, `source`, `capture_mode`, `keepalive`,
   `cable_rate_match`; keep parsing old files (serde `default` + ignore unknown keys,
   log a deprecation notice). Add `[bridge]` (`ring_target_ms`, `loopback_enabled`).
-- `wasapi-capture`: engine stops using it; the crate stays **only** for
+- [x] `wasapi-capture`: engine stops using it; the crate stays **only** for
   `capture-probe` (documented measurement tool — it measures VBMatrix In periods now).
-- Keep `ForbiddenMaster` ("EQ ASIO Router" must never be the master) — now genuinely
+- [x] Keep `ForbiddenMaster` ("EQ ASIO Router" must never be the master) — now genuinely
   load-bearing: the engine must refuse to open our own bridge as master.
-- Docs: README architecture diagram, `architecture.md` §1/§8, `setup-guide.md`
+- [x] Docs: README architecture diagram, `architecture.md` §1/§8, `setup-guide.md`
   (VBMatrix install, default playback = VBMatrix In, master clock = Internal Clock),
   `configuration.md`, `troubleshooting.md`, `development.md`, `latency.md` (new
   budget; VAC/Hi-Fi sections marked historical).
 
 ## Milestones (each ends with `cargo build --workspace --all-targets && cargo test`)
+
+- **Status (2026-10-13):** M0 done (driver registered; asio-probe run: 937 callbacks in 5.00 s vs ~938 expected; VBMatrix opens the slot). M1 done (bridge-abi cross-process tests green). M2 done (engine bridge source + loopback; 477 tests green). M3a done (WASAPI removal sweep; commit 0728f2c). M3b done (docs + Headroom rebrand + scripts). **M4 open (hardware validation).**
 
 - **M0 — driver skeleton + validation gate.** `bridge-abi` + v2 driver with COM,
   pacing thread, shm attached but shoveling locally (loopback in-process), registered.

@@ -1,4 +1,4 @@
-//! EQ ASIO Router GUI.
+//! Headroom GUI (binary `eq-asio-app`).
 //!
 //! Background operation: the app lives in the system tray (`tray`), can start with the
 //! user's login (`autostart`, a per-user Run entry launching `--background`) and allows only
@@ -66,7 +66,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("EQ ASIO Router")
+            .with_title("Headroom")
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([800.0, 500.0])
             .with_visible(!hidden),
@@ -79,7 +79,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "EQ ASIO Router",
+        "Headroom",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);

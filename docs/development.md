@@ -14,7 +14,7 @@ cargo clippy --workspace --all-targets
 ```
 
 - The running tray app locks its exe, so a rebuild into the same `target\` fails ("access denied"). Either quit the app first, or build into a separate directory, for example `cargo build --release --target-dir target\alt` (the investigation tools were built this way). The engine tests also need the engine mutex `Local\eq_asio_router_engine`: a running tray app makes some engine tests fail, so quit it before `cargo test`.
-- The frozen v1 driver is a 32-bit DLL for the VB-Audio ASIO Bridge: `cargo build -p eq-asio-driver --target i686-pc-windows-msvc --release` (needs `rustup target add i686-pc-windows-msvc`). Not needed for the router.
+- The driver builds for BOTH targets (VBMatrix loads the 64-bit DLL; 32-bit hosts load the i686 one): `cargo build -p eq-asio-driver --release` and `cargo build -p eq-asio-driver --target i686-pc-windows-msvc --release` (the 32-bit target needs `rustup target add i686-pc-windows-msvc`). Registration via `scripts/install-driver.ps1` (64-bit default, `-Both` for both).
 - Release profile: `opt-level 3`, thin LTO, `panic = "abort"`. A panic therefore ends the process in release builds; the audio path must not panic (see conventions).
 - Edition 2021, `windows` crate 0.62, workspace version 0.1.0.
 
@@ -30,7 +30,7 @@ cargo clippy --workspace --all-targets
 | `router-cli` | bin | Headless engine and diagnostics ([configuration.md](configuration.md#6-router-cli)) |
 | `eq-asio-app` | bin | egui GUI and tray |
 | `asio-probe` | bin | Console ASIO host for testing drivers |
-| `eq-asio-driver` | cdylib | Frozen v1 virtual driver; do not extend |
+| `eq-asio-driver` | cdylib | Virtual bridge driver (loaded by VBMatrix); do not extend |
 
 ## 3. Test strategy
 
@@ -39,9 +39,9 @@ cargo clippy --workspace --all-targets
 - Analyzer (`router-core/src/analyze.rs`): sine fit per segment (amplitude, phase, DC, frequency), glitch count, phase-step tracker for dropped or duplicated samples, plus music-safe statistics. Also available as `router-cli analyze`.
 - Alignment checks: `capture-probe check` compares a recording with the generated reference (mismatches, slips) to prove that a capture path is sample-accurate.
 - Fake-master seam: `EngineOptions.master_loader` replaces the ASIO driver loader (tests inject "driver busy", "not registered" and so on); `cable_formats` replaces the Windows cable-format access; `synthetic` replaces the WASAPI capture by a generated source; `config_path`, `publish_caps` and `status_mapping` keep tests away from user files and kernel objects. Engine tests are serialized because of the process-wide mutex.
-- COM smoke test for the frozen driver: `eq-asio-driver/tests/com_smoke.rs`.
+- COM smoke test for the bridge driver: `eq-asio-driver/tests/com_smoke.rs`.
 - Pipeline tests: `router-engine/src/pipeline_tests.rs` drive the callback logic with synthetic ring data.
-- VAC Line 1 logic is unit-tested without hardware: `eq-core/src/config.rs` (presets, sanitizing, per-device margins, old-file migration), `router-engine/src/source.rs` (`plan_capture`, `FallbackState` one-shot fallback and its reset rules, readiness evaluation), `router-engine/src/engine.rs` (keep-alive period conversion and the not-a-virtual-cable guard), `router-engine/src/cable.rs` (VAC is never touched), `router-engine/src/priority.rs` (MMCSS 1552 counts as OK), `wasapi-capture/src/session.rs` and `monitor.rs` (period planning, monitor policy, corruption rules) and `eq-asio-app/src/logic.rs` (preset texts, period choices, readiness rows). None of these exercise a real VAC driver; that is the pending hardware validation.
+- Bridge-era logic is unit-tested without hardware: `bridge-abi` cross-process ring tests, `eq-asio-driver` pacing and `com_smoke`, `router-engine/src/bridge.rs` (source, monitor, `FillWindow`, loopback feeder), `eq-core` config (`[bridge]`, deprecation notice, jitter rekey) and the `router-cli latency` selftest. Hardware validation (M4) is still pending.
 
 ## 4. Conventions
 
@@ -65,7 +65,7 @@ cargo clippy --workspace --all-targets
 ## 6. Known limitations and open items
 
 - The render side of the latency (app to capture event) cannot be observed by the router. `router-cli latency` measures it end to end and stores it (`latency_measured.toml`), and the readout uses that when a fresh matching entry exists, else an estimate (20 ms VAC, 100 ms Hi-Fi Cable) labelled as such. The measured render side depends on the client: about 25 ms inj->capture for a typical 10 ms shared client, about 7 ms for an IAudioClient3 client (see [latency.md](latency.md#5b-what-determines-the-render-side-vac-line-1-render-matrix)); real games and players have not been measured.
-- VAC Line 1 support (fixed capture period, render keep-alive, source presets, per-device jitter margins, corruption fallback, readiness panel and GUI) is implemented and builds, but its hardware validation is pending: real fixed-period capture, the keep-alive and a live fallback have not been run on hardware. Its latency figures (about 26-34 ms at 5 ms, 1-2 ms more at 6 ms; planner target about 600 frames, start target 784 at 288-frame packets) are model estimates. `capture-probe vac-check` now defaults to 288 frames (240 proved unreliable).
+- Bridge source implemented and unit-tested; hardware validation is pending (M4 checklist in [plans/vbmatrix-bridge.md](plans/vbmatrix-bridge.md)).
 - A fixed-period capture that trips the corruption monitor is reopened once in plain Shared with a warning (`capture_fallback`); it is not retried until the user presses "Retry fixed period" or changes the device or period.
 - `router-cli latency` (end-to-end measurement through the Yamaha's Streaming L/R loopback inputs) is implemented and has run live; it needs a quiet Yamaha loopback (a live microphone in the Streaming mix can make the noise floor too high, then the run aborts at the baseline without changing any limit).
 - Yamaha latency formula: only validated at 48 kHz for two settings plus the author's third (256, Low Latency, which selects the driver's "test" preset row). Other rates and USB modes are predictions.

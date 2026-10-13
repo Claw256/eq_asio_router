@@ -1,7 +1,7 @@
 //! Command-line flags (parsed by hand, no extra dependency).
 
 pub const HELP: &str = "\
-EQ ASIO Router (GUI)
+Headroom (GUI)
 
 Usage: eq-asio-app [OPTIONS]
 

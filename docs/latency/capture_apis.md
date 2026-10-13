@@ -1,4 +1,6 @@
-# Capture API survey for the EQ ASIO router (Windows 11 25H2, this machine)
+# Capture API survey for Headroom (Windows 11 25H2, this machine)
+
+> **Historical (pre-bridge).** These measurements predate the VBMatrix bridge and are kept verbatim.
 
 > Purpose: survey of capture APIs that could give the router a smaller or more regular period than the Hi-Fi Cable.
 > Date: 2026-10-10. Method: read-only enumeration and short quiet measurements with `capture-probe`; legend M / E / I below separates measured, earlier-measured and inferred values.

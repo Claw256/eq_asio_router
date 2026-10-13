@@ -468,7 +468,7 @@ impl App {
         let busy = self.snap.busy.is_some();
         let engine_present = self.snap.engine_present;
         ui.horizontal_wrapped(|ui| {
-            ui.heading("EQ ASIO Router");
+            ui.heading("Headroom");
             ui.add_space(8.0);
             ui.label(egui::RichText::new(format!("\u{25CF} {text}")).color(color).strong());
             ui.add_space(8.0);

@@ -1,5 +1,7 @@
 # Virtual Audio Cable (lite 4.70) "Line 1" as a low-latency router source
 
+> **Historical (pre-bridge).** These measurements predate the VBMatrix bridge and are kept verbatim.
+
 > Purpose: is Virtual Audio Cable lite "Line 1" a usable low-latency source for the router, and what would the integration need.
 > Date: 2026-10-10. Method: read-only investigation plus quiet test audio (-50 dBFS, 8 to 14 s) into Line 1, replay of measured capture gaps through the arrival model.
 > Back to the [documentation index](../README.md).
